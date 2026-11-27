@@ -136,7 +136,7 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: crate::host::TextureReadback,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -187,11 +187,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = host.texture_readback_buffer(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer.resource()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -274,11 +274,11 @@ pub(crate) fn land(back: &Back) {
     // SAFETY: our read-back buffer, written by the list that has run; `len`
     // ends with its last subresource, which it holds.
     let data = unsafe {
-        if back.buffer.Map(0, None, Some(&mut mapped)).is_err() || mapped.is_null() {
+        if back.buffer.resource().Map(0, None, Some(&mut mapped)).is_err() || mapped.is_null() {
             return;
         }
         let data = std::slice::from_raw_parts(mapped.cast::<u8>().cast_const(), len).to_vec();
-        back.buffer.Unmap(0, None);
+        back.buffer.resource().Unmap(0, None);
         data
     };
     let landing = Landing {
@@ -306,8 +306,33 @@ fn stale() {
     }
 }
 
+/// Temporary pixels and the layouts reused by the writes of one thread
+/// (the writer's, or the one that lands submissions with
+/// `VICTORY_TEXBACK_ASYNC=0`).
+#[derive(Default)]
+struct Scratch {
+    pixels: Vec<u8>,
+    tiling: victory_formats::texture::TilingCache,
+}
+
+/// What `Scratch::pixels` keeps after a write: a larger one is given back.
+const SCRATCH_KEPT: usize = 64 << 20;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 /// Tiles a read-back's texels into its title allocation.
 fn write(landing: &Landing) {
+    SCRATCH.with_borrow_mut(|scratch| {
+        write_with(landing, scratch);
+        if scratch.pixels.capacity() > SCRATCH_KEPT {
+            scratch.pixels = Vec::new();
+        }
+    });
+}
+
+fn write_with(landing: &Landing, scratch: &mut Scratch) {
     use crate::land::{count, spent, stat};
     static COPIED: AtomicU64 = AtomicU64::new(0);
     let asked = std::time::Instant::now();
@@ -320,9 +345,13 @@ fn write(landing: &Landing) {
     }
     let (at, end) = (landing.ticket.at, landing.ticket.end);
     let size = end - at;
-    let mut tiled = vec![0u8; size];
+    if scratch.pixels.len() < size {
+        scratch.pixels.reserve_exact(size - scratch.pixels.len());
+        scratch.pixels.resize(size, 0);
+    }
+    let tiled = &mut scratch.pixels[..size];
     // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    if !crate::host::read_into(at as *const u8, tiled) {
         return;
     }
     for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
@@ -331,7 +360,8 @@ fn write(landing: &Landing) {
         let pitch = f.RowPitch as usize;
         let from = footprint.Offset as usize;
         let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
-        if let Err(e) = landing.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        let pitches = (pitch, pitch * rows as usize);
+        if let Err(e) = scratch.tiling.tile(&landing.layout, tiled, (mip, slice), linear, pitches) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             return;

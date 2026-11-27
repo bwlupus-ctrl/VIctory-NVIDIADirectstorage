@@ -418,6 +418,10 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// The host heaps (view, sampler) the list has, by host object, 0 for
+    /// none: another title heap that comes to the same host heaps leaves
+    /// the list as it is ([`same_host_heaps`]).
+    host_heap_objs: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1227,6 +1231,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_heap_objs = [0; 2];
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1529,18 +1534,26 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            let hosts: [Option<ID3D12DescriptorHeap>; 2] = self.heaps.map(|h| {
+                (h != 0)
+                    .then(|| crate::descriptor::heap(h as This).host().map(|h| h.heap.clone()))
+                    .flatten()
+            });
+            let objs = hosts.each_ref().map(|h| h.as_ref().map_or(0, |h| h.as_raw() as usize));
+            // Title heaps that come to the host heaps the list already has
+            // (a title heap without a host one): setting them again would
+            // only clear the root signature and its bindings, which every
+            // draw and dispatch sets again.
+            if !(same_host_heaps() && objs == self.host_heap_objs) {
+                let heaps: Vec<Option<ID3D12DescriptorHeap>> =
+                    hosts.into_iter().filter(Option::is_some).collect();
+                heaps.iter().flatten().for_each(|h| list.keep(h));
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { l.SetDescriptorHeaps(&heaps) };
+                self.host_heap_objs = objs;
+                self.host_roots = [0; 2];
+            }
             self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -4955,6 +4968,15 @@ fn view_state(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(80).collect(),
     }
+}
+
+/// Whether a change of title heaps that leaves the host heaps as they are
+/// skips `SetDescriptorHeaps` and the root signature's reset (on by
+/// default; `VICTORY_SAME_HOST_HEAPS=0`: set again on every change, as
+/// before).
+fn same_host_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SAME_HOST_HEAPS").map_or(true, |v| v.trim() != "0"))
 }
 
 /// A view in a few words (diagnostics builds).

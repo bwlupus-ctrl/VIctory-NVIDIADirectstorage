@@ -836,17 +836,25 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Joined in place, in the allocation they came in.
+    let mut last = 0;
+    for index in 1..ranges.len() {
+        let (from, to) = ranges[index];
+        if from <= ranges[last].1 {
+            ranges[last].1 = ranges[last].1.max(to);
+        } else {
+            last += 1;
+            ranges[last] = (from, to);
         }
     }
-    out
+    ranges.truncate(last + 1);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -1111,6 +1119,17 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
+    for_outside(from, to, skip, |a, b| out.push((a, b)));
+    out
+}
+
+/// Visits the parts of `[from, to)` outside ranges sorted by their start.
+fn for_outside(
+    from: usize,
+    to: usize,
+    skip: impl IntoIterator<Item = (usize, usize)>,
+    mut part: impl FnMut(usize, usize),
+) {
     let mut at = from;
     for (a, b) in skip {
         if b <= at {
@@ -1120,14 +1139,13 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
             break;
         }
         if a > at {
-            out.push((at, a));
+            part(at, a);
         }
         at = at.max(b);
     }
     if at < to {
-        out.push((at, to));
+        part(at, to);
     }
-    out
 }
 
 #[cfg(test)]
@@ -1348,25 +1366,109 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool { buffers: Vec::new(), bytes: 0 });
+
+#[derive(Default)]
+struct SnapshotPool {
+    /// Descending capacity order, kept on insertion and removal.
+    buffers: Vec<Vec<u8>>,
+    /// Their capacities in all: an ordinary return skips the limit scan.
+    bytes: usize,
+}
+
+impl SnapshotPool {
+    /// The smallest buffer of at least `n` bytes, if it is not past four
+    /// times that (or 1 MiB).
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let i = self.buffers.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+        if self.buffers[i].capacity() > most {
+            return None;
+        }
+        let v = self.buffers.remove(i);
+        self.bytes -= v.capacity();
+        Some(v)
+    }
+
+    fn put(&mut self, v: Vec<u8>) {
+        let capacity = v.capacity();
+        let i = self.buffers.partition_point(|b| b.capacity() >= capacity);
+        self.buffers.insert(i, v);
+        self.bytes += capacity;
+    }
+
+    /// Keeps the largest buffers, at most `count`, of them the largest and
+    /// the next ones up to `most` bytes in all; returns the others.
+    fn keep_largest(&mut self, count: usize, most: usize) -> Vec<Vec<u8>> {
+        if self.buffers.len() <= count && self.bytes <= most {
+            return Vec::new();
+        }
+        let (mut keep, mut bytes) = (0, 0);
+        for v in self.buffers.iter().take(count) {
+            let next = bytes + v.capacity();
+            if keep > 0 && next > most {
+                break;
+            }
+            keep += 1;
+            bytes = next;
+        }
+        self.bytes = bytes;
+        self.buffers.split_off(keep)
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn sizes(pool: &[Vec<u8>]) -> Vec<usize> {
+        pool.iter().map(Vec::capacity).collect()
+    }
+
+    fn pool_with_sizes(mib: &[usize]) -> SnapshotPool {
+        let mut pool = SnapshotPool::default();
+        for &n in mib {
+            pool.put(Vec::with_capacity(n << 20));
+        }
+        pool
+    }
+
+    #[test]
+    fn reuse_takes_the_smallest_fit_and_tracks_capacity() {
+        let mut pool = pool_with_sizes(&[8, 1, 4, 2, 4]);
+        assert!(pool.take(9 << 20).is_none());
+        assert_eq!(pool.take(3 << 20).unwrap().capacity(), 4 << 20);
+        assert_eq!(pool.take(5 << 20).unwrap().capacity(), 8 << 20);
+        assert_eq!(sizes(&pool.buffers), [4 << 20, 2 << 20, 1 << 20]);
+        assert_eq!(pool.bytes, 7 << 20);
+        assert_eq!(pool.take(1).unwrap().capacity(), 1 << 20);
+        assert!(pool.take(1).is_none());
+        assert_eq!(pool.bytes, 6 << 20);
+    }
+
+    #[test]
+    fn returns_obey_size_and_count_limits() {
+        let mut pool = pool_with_sizes(&[8, 2, 4, 1]);
+        assert!(pool.keep_largest(4, 16 << 20).is_empty());
+        assert_eq!(pool.bytes, 15 << 20);
+        assert_eq!(sizes(&pool.keep_largest(2, 16 << 20)), [2 << 20, 1 << 20]);
+        assert_eq!(pool.bytes, 12 << 20);
+        assert_eq!(sizes(&pool.keep_largest(2, 7 << 20)), [4 << 20]);
+        assert_eq!(pool.bytes, 8 << 20);
+        assert_eq!(sizes(&pool.keep_largest(0, 7 << 20)), [8 << 20]);
+        assert!(pool.buffers.is_empty());
+        assert_eq!(pool.bytes, 0);
+    }
+}
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    // A new buffer is made outside the pool's lock.
+    let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    let mut v = reused.unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
 }
@@ -1390,19 +1492,11 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    let count = snapshots_kept();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
-        total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
-            break;
-        }
-        kept += 1;
-    }
+    pool.put(v);
     // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
+    let gone = pool.keep_largest(count, KEPT);
     drop(pool);
     drop(gone);
 }
@@ -3026,7 +3120,7 @@ pub(crate) fn memory() -> [u64; 6] {
     };
     let (kept, kept_bytes) = {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+        (pool.buffers.len() as u64, pool.bytes as u64)
     };
     [
         LIVE[0].load(Ordering::Relaxed),
@@ -4747,14 +4841,19 @@ impl Shadow {
     /// # Safety
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
-    pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+    pub(crate) unsafe fn land_card(
+        &self,
+        pieces: impl Iterator<Item = (usize, usize, usize)> + Clone,
+        fetched_after: u64,
+        notes: &mut crate::land::Notes,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
-        let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
+        let (from, to) = pieces.clone().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -4762,20 +4861,31 @@ impl Shadow {
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
+        // Both sources of protected bytes can overlap. Join them once so
+        // each piece can find its first overlapping range by end address.
+        let skip = if skip.len() > 1 { joined(skip) } else { skip };
+        let mut partial = Vec::new();
         let mut put = 0;
-        for &(lo, hi, now) in pieces {
+        for (lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            let near = &skip[skip.partition_point(|&(_, end)| end <= lo)..];
+            let whole = [(0, hi - lo)];
+            let parts: &[(usize, usize)] = if near.first().is_none_or(|&(start, _)| start >= hi) {
+                &whole
+            } else {
+                partial.clear();
+                for_outside(lo, hi, near.iter().copied(), |a, b| partial.push((a - lo, b - lo)));
+                &partial
+            };
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -4943,7 +5053,7 @@ mod land_tests {
                     pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo)).collect();
                 let mut notes = crate::land::Notes::default();
                 // SAFETY: the fetched bytes are `now`'s.
-                unsafe { many.land_card(&addressed, after, &mut notes) };
+                unsafe { many.land_card(addressed.iter().copied(), after, &mut notes) };
                 notes.flush();
                 assert!(bytes(a) == bytes(b), "title memory, round {round}");
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
@@ -5006,7 +5116,7 @@ mod land_tests {
                     let mut notes = crate::land::Notes::default();
                     let (lo, hi) = (b * PIECE, (b + 1) * PIECE);
                     // SAFETY: the fetched bytes are `now`'s; each block once.
-                    unsafe { shadow.land_card(&[(lo, hi, at + lo)], 8, &mut notes) };
+                    unsafe { shadow.land_card(std::iter::once((lo, hi, at + lo)), 8, &mut notes) };
                     notes.flush();
                 });
                 for i in (3..LEN / 4).step_by(4 * 53) {

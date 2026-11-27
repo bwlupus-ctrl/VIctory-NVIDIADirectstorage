@@ -15,6 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Optional global allocator (`--features mimalloc`). On Windows with
+// diagnostics, copystat counts allocations and uses this same backend.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]

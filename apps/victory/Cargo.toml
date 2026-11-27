@@ -29,6 +29,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# mimalloc as the global allocator (needs a C compiler to build).
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

@@ -57,6 +57,9 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Texture read-back buffers kept for reuse (`VICTORY_READBACK_POOL=1`;
+    /// off by default: each is made when asked for and freed with its list).
+    texture_readbacks: ReadbackPool<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -1133,6 +1136,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            texture_readbacks: ReadbackPool::new(),
         })
     }
 }
@@ -2089,6 +2093,209 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+}
+
+/// Texture readback buffers are kept apart from the mapped upload chunks.
+/// Pool only common sizes and count buffer widths, not driver residency.
+fn texture_readback_idle_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if !std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|value| value == "1") {
+            return 0;
+        }
+        std::env::var("VICTORY_READBACK_POOL_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .and_then(|mib| mib.checked_mul(1 << 20))
+            .unwrap_or(256 << 20)
+    })
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ReadbackStats {
+    pub(crate) created: u64,
+    pub(crate) reused: u64,
+    pub(crate) allocation_failures: u64,
+    pub(crate) allocation_us: u64,
+    pub(crate) peak_allocation_us: u64,
+    pub(crate) active_buffers: u64,
+    pub(crate) active_bytes: u64,
+    pub(crate) peak_active_bytes: u64,
+    pub(crate) idle_bytes: u64,
+    pub(crate) peak_idle_bytes: u64,
+}
+
+struct ReadbackPool<T>(Mutex<(Spare<T>, ReadbackStats)>);
+
+impl<T> ReadbackPool<T> {
+    fn new() -> Self {
+        Self(Mutex::new((Spare::new(), ReadbackStats::default())))
+    }
+
+    fn take(
+        &self,
+        size: u64,
+        idle_limit: u64,
+        mut allocate: impl FnMut(u64) -> Option<T>,
+    ) -> Option<ReadbackLease<'_, T>> {
+        let size = size.max(1);
+        let class = size
+            .max(64 << 10)
+            .checked_next_power_of_two()
+            .filter(|&bytes| bytes <= (16 << 20) && bytes <= idle_limit);
+        if let Some(bytes) = class {
+            let (idle, stats) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(buffer) = idle.take(bytes) {
+                stats.reused += 1;
+                stats.idle_bytes = idle.bytes;
+                return Some(self.lease(buffer, bytes, idle_limit, stats));
+            }
+        }
+
+        // Do not hold the pool lock across a driver allocation. If rounding
+        // up was refused, make the old, exact-sized allocation once.
+        let capacity = class.unwrap_or(size);
+        let mut allocation_us = 0;
+        let mut peak_allocation_us = 0;
+        let mut measured_allocate = |bytes| {
+            let started = std::time::Instant::now();
+            let buffer = allocate(bytes);
+            let us = started.elapsed().as_micros() as u64;
+            allocation_us += us;
+            peak_allocation_us = peak_allocation_us.max(us);
+            buffer
+        };
+        let (buffer, bytes, retain, failed_first) = match measured_allocate(capacity) {
+            Some(buffer) => (Some(buffer), capacity, class.map_or(0, |_| idle_limit), 0),
+            None if capacity != size => (measured_allocate(size), size, 0, 1),
+            None => (None, size, 0, 0),
+        };
+        let (_, stats) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
+        stats.allocation_failures += failed_first + u64::from(buffer.is_none());
+        stats.allocation_us += allocation_us;
+        stats.peak_allocation_us = stats.peak_allocation_us.max(peak_allocation_us);
+        let buffer = buffer?;
+        stats.created += 1;
+        Some(self.lease(buffer, bytes, retain, stats))
+    }
+
+    fn lease(
+        &self,
+        buffer: T,
+        bytes: u64,
+        idle_limit: u64,
+        stats: &mut ReadbackStats,
+    ) -> ReadbackLease<'_, T> {
+        stats.active_buffers += 1;
+        stats.active_bytes += bytes;
+        stats.peak_active_bytes = stats.peak_active_bytes.max(stats.active_bytes);
+        ReadbackLease { pool: self, buffer: Some(buffer), bytes, idle_limit }
+    }
+}
+
+pub(crate) type TextureReadback = ReadbackLease<'static, ID3D12Resource>;
+
+/// An exclusive buffer owned by a list's recorded texture readback. It stays
+/// checked out while that recording exists, even after one execution lands.
+pub(crate) struct ReadbackLease<'a, T> {
+    pool: &'a ReadbackPool<T>,
+    buffer: Option<T>,
+    bytes: u64,
+    idle_limit: u64,
+}
+
+impl<T> ReadbackLease<'_, T> {
+    pub(crate) fn resource(&self) -> &T {
+        self.buffer.as_ref().expect("a live readback has its buffer")
+    }
+
+    pub(crate) fn stats(&self) -> ReadbackStats {
+        self.pool.0.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+}
+
+impl<T> Drop for ReadbackLease<'_, T> {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else { return };
+        let released = {
+            let (idle, stats) = &mut *self.pool.0.lock().unwrap_or_else(|e| e.into_inner());
+            stats.active_buffers -= 1;
+            stats.active_bytes -= self.bytes;
+            let released = idle.give(buffer, self.bytes, self.idle_limit);
+            stats.idle_bytes = idle.bytes;
+            stats.peak_idle_bytes = stats.peak_idle_bytes.max(stats.idle_bytes);
+            released
+        };
+        // Drop a committed D3D12 resource outside the lock.
+        drop(released);
+    }
+}
+
+#[cfg(test)]
+mod readback_pool_tests {
+    use super::*;
+
+    #[test]
+    fn readback_pool_leases_are_exclusive_until_retired_and_idle_bytes_are_bounded() {
+        const CLASS: u64 = 64 << 10;
+        let pool = ReadbackPool::new();
+        let mut created = 0;
+        let mut allocate = |bytes| {
+            assert_eq!(bytes, CLASS);
+            created += 1;
+            Some(created)
+        };
+        let first = pool.take(32 << 10, CLASS, &mut allocate).unwrap();
+        let second = pool.take(32 << 10, CLASS, &mut allocate).unwrap();
+        assert_eq!(*first.resource(), 1);
+        assert_eq!(*second.resource(), 2);
+        // Inspecting the same recording again (as a repeated submission
+        // does at landing) cannot make its still-owned buffer available.
+        assert_eq!(*first.resource(), 1);
+        let stats = first.stats();
+        assert_eq!((stats.created, stats.reused, stats.active_buffers), (2, 0, 2));
+        assert_eq!((stats.active_bytes, stats.peak_active_bytes, stats.idle_bytes), (2 * CLASS, 2 * CLASS, 0));
+
+        drop(first);
+        let reused = pool.take(32 << 10, CLASS, &mut allocate).unwrap();
+        assert_eq!(*reused.resource(), 1);
+        assert_eq!(*second.resource(), 2);
+        drop(reused);
+        drop(second);
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.created, stats.reused, stats.active_buffers, stats.active_bytes), (2, 1, 0, 0));
+        assert_eq!((stats.idle_bytes, stats.peak_idle_bytes), (CLASS, CLASS));
+    }
+
+    #[test]
+    fn readback_pool_uses_exact_unshared_allocations_when_disabled_or_over_the_class_limit() {
+        let pool = ReadbackPool::new();
+        for (size, limit) in [(32 << 10, 0), (32 << 10, 16 << 10), ((16 << 20) + 1, 256 << 20)] {
+            let lease = pool.take(size, limit, Some).unwrap();
+            assert_eq!(*lease.resource(), size);
+        }
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.created, stats.reused, stats.idle_bytes, stats.active_buffers), (3, 0, 0, 0));
+    }
+
+    #[test]
+    fn readback_pool_tries_original_size_after_a_rounded_allocation_fails() {
+        let pool = ReadbackPool::new();
+        let mut attempts = Vec::new();
+        let lease = pool
+            .take(32 << 10, 256 << 20, |size| {
+                attempts.push(size);
+                (size == (32 << 10)).then_some(size)
+            })
+            .unwrap();
+        assert_eq!(attempts, [64 << 10, 32 << 10]);
+        assert_eq!(lease.stats().allocation_failures, 1);
+        assert_eq!(*lease.resource(), 32 << 10);
+        drop(lease);
+        assert!(pool.take(32 << 10, 256 << 20, |_| None).is_none());
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.created, stats.allocation_failures, stats.idle_bytes), (1, 3, 0));
     }
 }
 
@@ -5186,15 +5393,16 @@ impl Host {
                     }
                 }
                 let mut notes = land::Notes::default();
+                let mut merged = 0;
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    let addressed = run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    merged += unsafe { run[0].0.land_card(addressed, after, &mut notes) };
                 }
                 notes.flush();
+                put.fetch_add(merged, Ordering::Relaxed);
                 land::spent(land::stat::CARD_ALL, working);
             });
             land::count(land::stat::JOBS, jobs.len() as u64);
@@ -5761,6 +5969,7 @@ impl Host {
                         Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
                     }
                 }
+                self.verify_texture_readback_fence(*submitted);
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -6377,6 +6586,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            self.verify_texture_readback_fence(*submitted);
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
@@ -6846,7 +7056,12 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        let texture_backs = {
+            let mut deferred = self.deferred();
+            let texture_backs = std::mem::take(&mut deferred.texture_backs);
+            *deferred = Deferred::default();
+            texture_backs
+        };
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6872,6 +7087,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        // Reuse only after the old native commands have been discarded.
+        drop(texture_backs);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -8727,8 +8944,8 @@ impl Batch {
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
@@ -8889,13 +9106,8 @@ impl Batch {
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = self.refreshes.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
@@ -9422,7 +9634,25 @@ impl Host {
         &self.queue
     }
 
-    /// A buffer in the upload heap, mapped for writing.
+    pub(crate) fn texture_readback_buffer(&'static self, size: u64) -> Option<TextureReadback> {
+        self.texture_readbacks.take(size, texture_readback_idle_limit(), |bytes| self.read_back_buffer(bytes))
+    }
+
+    /// The synchronous wait paths can warn and proceed when setting the
+    /// event fails. A pooled buffer cannot be retired on an unverified wait.
+    /// The relay already selects flights by their completed fence value.
+    fn verify_texture_readback_fence(&self, submitted: u64) {
+        if texture_readback_idle_limit() != 0 {
+            // SAFETY: a plain query. MAX is D3D12's device-removed sentinel.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed < submitted || completed == u64::MAX {
+                fail(format_args!(
+                    "texture readback pool cannot retire before fence {submitted} (completed {completed})"
+                ));
+            }
+        }
+    }
+
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
@@ -9464,6 +9694,7 @@ impl Host {
         }
     }
 
+    /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
@@ -10981,7 +11212,7 @@ mod refresh_tests {
                         crate::land::each(parts.len(), &|i| {
                             let mut notes = crate::land::Notes::default();
                             // SAFETY: the bytes of `now`; each piece once.
-                            unsafe { c.shadow.land_card(parts[i], after, &mut notes) };
+                            unsafe { c.shadow.land_card(parts[i].iter().copied(), after, &mut notes) };
                             notes.flush();
                         });
                         for &(from, to) in &ranges {
@@ -11284,7 +11515,7 @@ mod refresh_tests {
                             pieces.iter().map(|p| (p * PAGE + 8, (p + 1) * PAGE - 8, now.as_ptr() as usize)).collect();
                         let mut notes = crate::land::Notes::default();
                         // SAFETY: the bytes of `now`; nothing else lands here.
-                        unsafe { lands.land_card(&pieces, 0, &mut notes) };
+                        unsafe { lands.land_card(pieces.iter().copied(), 0, &mut notes) };
                         notes.flush();
                     }
                     started.elapsed().as_secs_f64() * 1e3
