@@ -20,10 +20,15 @@ pub mod dstorage;
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
+// LOCAL (page-kinds): measurement-only title page table reader.
+#[cfg(windows)]
+pub mod pagekinds;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
+// LOCAL: which parts of its files the title reads (`VICTORY_READ_MAP`).
+pub mod read_map;
 #[cfg(windows)]
 pub mod net;
 pub mod rpcrt4;

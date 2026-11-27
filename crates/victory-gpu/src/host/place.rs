@@ -119,6 +119,8 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
                 let (at, len) = staging.memory();
                 touches(&ranges, at, at + len)
             }
+            // LOCAL (port of cool_fox 8cc31ab): a movie plane's read.
+            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
             Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
             Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
             _ => false,

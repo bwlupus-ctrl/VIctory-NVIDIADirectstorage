@@ -103,10 +103,17 @@ pub fn import(name: &str, address: usize) -> usize {
     let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || copies_on();
     #[cfg(not(feature = "diagnostics"))]
     let on = copies_on();
+    // LOCAL (wc-vram): with blocks in card memory (`VICTORY_WC_VRAM`) the title's copies out of
+    // them are counted and streamed ([`copied`]).
+    let on = on || crate::wc_vram::on();
     if !on {
         return address;
     }
     REAL[which].store(address, Relaxed);
+    // LOCAL (heap-probe): faults in these (and under them) are the title's own reads
+    // (`VICTORY_HEAP_PROBE=1`; off: nothing).
+    crate::heapprobe::add_helper(ours);
+    crate::heapprobe::add_helper(address);
     ours
 }
 
@@ -138,6 +145,28 @@ unsafe extern "system-unwind" fn shift(to: *mut u8, from: *const u8, n: usize) -
 unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8 {
     // SAFETY: the host's function, noted by `import` before the title ran.
     let real: Copy = unsafe { std::mem::transmute(real) };
+    // LOCAL (wc-vram): a copy out of a block in card memory (`crate::wc_vram`): counted, and read
+    // with streaming loads (plain loads cross the bus a few bytes at a time). Into a scratch
+    // first where the destination is guarded or meets the source; a copy partly in a block reads
+    // as before. Off: one relaxed load.
+    if n != 0 && crate::wc_vram::touches(from as usize, n) {
+        crate::wc_vram::count(crate::wc_vram::Count::TitleCopies, 1);
+        crate::wc_vram::count(crate::wc_vram::Count::TitleCopyBytes, n as u64);
+        if crate::wc_vram::holds(from as usize, n) {
+            let apart = to as usize + n <= from as usize || from as usize + n <= to as usize;
+            if apart && !crate::watch::guards_any(to as usize, n) {
+                // SAFETY: the source lies in a block (whole lines of it readable), the
+                // destination is the title's.
+                unsafe { crate::wc_vram::stream_load(from, to, n) };
+                return to;
+            }
+            let mut scratch = vec![0u8; n];
+            // SAFETY: as above; the scratch holds `n` bytes.
+            unsafe { crate::wc_vram::stream_load(from, scratch.as_mut_ptr(), n) };
+            // SAFETY: the scratch is no block: the copy as before, from it.
+            return unsafe { copied(to, scratch.as_ptr(), n, real as usize) };
+        }
+    }
     if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_on() || overlap(to as usize, from as usize, n) {
         // SAFETY: by the caller.
         return unsafe { real(to, from, n) };
@@ -181,7 +210,14 @@ unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u
 pub(crate) unsafe fn put(to: *mut u8, from: *const u8, n: usize) {
     // SAFETY: by the caller.
     unsafe {
-        let there = || std::slice::from_raw_parts(to.cast_const(), n) == std::slice::from_raw_parts(from, n);
+        // LOCAL (wc-vram): a destination in card memory is read with streaming loads to compare.
+        let there = || {
+            if crate::wc_vram::touches(to as usize, n) {
+                let mut now = vec![0u8; n];
+                return crate::wc_vram::copy_out(to as usize, &mut now) && now == std::slice::from_raw_parts(from, n);
+            }
+            std::slice::from_raw_parts(to.cast_const(), n) == std::slice::from_raw_parts(from, n)
+        };
         if crate::toggled!("VICTORY_SAME_RECORDS") && there() {
             add(8);
             return;
@@ -335,6 +371,9 @@ pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug
     if !stores_on() {
         return false;
     }
+    // LOCAL (gpu-first): the store is looked at against what is there (a read of title memory,
+    // counted when it is write-combined; off unless asked for).
+    crate::memclass::wc_read(at, 8);
     let rip = context.Rip as usize;
     let site = site(rip);
     let counts = site.load(Relaxed);

@@ -2525,6 +2525,8 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
+        // LOCAL (port of cool_fox ab75ac3): uploads back off after this.
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -2932,21 +2934,38 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+/// (address and description): for [`PLACED_TWINS`]. LOCAL (upstream-port
+/// 5b36758): diagnostics builds only, and there only with
+/// `VICTORY_PLACED_TWINS_STATS=1` ([`twins_stats`]); at most
+/// [`PLACED_RAW_MAX`] entries.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
-/// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+/// filler was left out of the key ([`texture_at`]). Diagnostics builds only.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// See [`PLACED_TWINS`].
-#[cfg(windows)]
-pub(crate) fn placed_filler_twins() -> u64 {
-    PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+/// LOCAL (upstream-port 5b36758): the most raw descriptions [`PLACED_RAW`]
+/// keeps; past it nothing is inserted and the count stops (logged once).
+#[cfg(all(windows, feature = "diagnostics"))]
+const PLACED_RAW_MAX: usize = 4096;
+
+/// LOCAL (upstream-port 5b36758): whether the filler-twins statistics are
+/// kept: `VICTORY_PLACED_TWINS_STATS=1` (off otherwise, so a diagnostics
+/// build that is played pays for neither the second mutex nor the scan).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn twins_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_TWINS_STATS").is_some_and(|v| v == "1"))
+}
+
+/// See [`PLACED_TWINS`]. `None` unless [`twins_stats`] is on.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_filler_twins() -> Option<u64> {
+    twins_stats().then(|| PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Width, height and format of texture `this` (`None` for a buffer), for
@@ -3025,6 +3044,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // LOCAL (upstream-port 5b36758): only the diagnostics-only filler-twins
+    // tracking below reads `raw`; the functional cache key is `key` alone.
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3034,17 +3056,29 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
-    if raw != key {
+    // the log: `placed_filler_twins`). LOCAL (upstream-port 5b36758):
+    // diagnostics builds only, and only with `VICTORY_PLACED_TWINS_STATS=1`;
+    // the scan stops at the second match and nothing is inserted past
+    // `PLACED_RAW_MAX` entries.
+    #[cfg(feature = "diagnostics")]
+    if raw != key && twins_stats() {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
+        if seen.len() >= PLACED_RAW_MAX {
+            static FULL: std::sync::Once = std::sync::Once::new();
+            FULL.call_once(|| {
+                tracing::info!(
+                    max = PLACED_RAW_MAX,
+                    "placed texture filler twins: the table is full; the count stops here"
+                )
+            });
+        } else if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
                 blank[1] = 0;
                 blank[13] = 0;
                 blank == key
             });
-            if others.count() > 1 {
+            if others.take(2).count() > 1 {
                 PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }

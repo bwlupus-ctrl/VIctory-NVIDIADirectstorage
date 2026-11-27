@@ -71,7 +71,8 @@ pub(crate) fn probe_level() -> u8 {
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
 /// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
+/// the title maps pages. LOCAL: unless [`views_on`] (with
+/// `VICTORY_POOL_COMMIT=1`), for windows that are one run of a section.
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
@@ -111,6 +112,374 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// LOCAL: placed over a section of physical pages ([`place_view`]), not
+    /// over a part of private memory.
+    pub(crate) view: bool,
+}
+
+/// LOCAL: `VICTORY_INPLACE_VIEWS=1`, with [`level`] 1 or more: a window
+/// outside buffers whose bytes are all one run of one section of the
+/// title's physical pages ([`Cover::Run`]) is not copied either, if the
+/// section was made with `SEC_COMMIT` (`VICTORY_POOL_COMMIT=1` on Windows):
+/// the section is opened as a host heap once ([`From::Section`], kept per
+/// section) and a buffer is placed over the run's offset in it
+/// ([`place_view`]). The GPU reads the section's pages, which every view of
+/// them shows, so what the title writes through any address of a page is
+/// there with no write watching and no guard. A window over scattered
+/// pages, or over unmapped ones, keeps its copy; so does a title buffer
+/// over a view.
+///
+/// Such a window shows the pages the title had at its addresses when it
+/// was placed. It is let go before the runtime changes any view in its
+/// range (`crate::watch::title_memory_unmapping` and `_remapped` call
+/// [`title_memory_freeing`]; every map and unmap of `xmem` goes through
+/// them), and heap slots made on it are made anew ([`slots_stale`]). A
+/// page shown at another address too changes nothing for it: the bytes
+/// are the section's, wherever they are seen, and the section's pages are
+/// never given out again while a view shows them.
+///
+/// `VICTORY_INPLACE_MB` does not count these windows: it bounds memory
+/// locked by opening, and a section's heap locks nothing when opened (the
+/// probe: 0.2 ms, no working set); it is opened whole, once, whatever the
+/// windows over it.
+pub(crate) fn views_on() -> bool {
+    #[cfg(test)]
+    if tests::VIEWS_ON.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| level() >= 1 && std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// LOCAL: of windows over views ([`views_on`]): in place now and their
+/// bytes; since the start, turned down because their pages are scattered,
+/// because some are not mapped, because the section is reserved, because
+/// the section or the run is not known whole, because the host refused (the
+/// heap or the buffer); sections opened as heaps; windows let go because
+/// their views changed; and of those, ones heap slots showed.
+static VIEW_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// LOCAL: asks of [`place_for`] under way, from before they look at the
+/// views until what they placed is counted in [`VIEW_STATS`]: a change of
+/// mapping in between must not skip the let go ([`title_memory_freeing`]).
+static PLACING: AtomicU64 = AtomicU64::new(0);
+
+/// LOCAL: the longest window placed over a view, for the let go's search
+/// (`crate::shadow::in_place_let_go`).
+static LONGEST: AtomicU64 = AtomicU64::new(0);
+
+struct Placing;
+
+impl Placing {
+    fn begin() -> Placing {
+        PLACING.fetch_add(1, Ordering::SeqCst);
+        Placing
+    }
+}
+
+impl Drop for Placing {
+    fn drop(&mut self) {
+        PLACING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// LOCAL: the longest window placed over a view so far (0: none).
+pub(crate) fn longest() -> u64 {
+    LONGEST.load(Ordering::Relaxed)
+}
+
+/// LOCAL: why a window was not placed in place ([`views_on`] only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Views hold it, from more than one place in their sections.
+    Scattered,
+    /// Views hold only a part of it.
+    Holes,
+    /// One run of a section made reserved (`VICTORY_POOL_COMMIT` unset).
+    Reserved,
+    /// One run of a section not known (whole).
+    Unknown,
+    /// The host refused the heap or the buffer.
+    Host,
+    /// A title buffer over a view: only windows are placed there.
+    Buffer,
+    /// Not a view, and not private memory committed whole.
+    NotPrivate,
+    /// Over `VICTORY_INPLACE_MB`.
+    Most,
+}
+
+impl Refusal {
+    fn why(self) -> &'static str {
+        match self {
+            Refusal::Scattered => "view memory, scattered pages (a copy)",
+            Refusal::Holes => "view memory with unmapped pages (a copy)",
+            Refusal::Reserved => "one run of a section made reserved (VICTORY_POOL_COMMIT=1 makes it committed)",
+            Refusal::Unknown => "one run of a section the runtime did not tell of whole",
+            Refusal::Host => "the host refused the section's heap or a buffer in it",
+            Refusal::Buffer => "a title buffer over view memory (only windows are placed over views)",
+            Refusal::NotPrivate => "not a view, and not private memory committed whole",
+            Refusal::Most => "over VICTORY_INPLACE_MB",
+        }
+    }
+}
+
+/// LOCAL: the first few refusals of each kind, said with their reason.
+fn turned_down(start: u64, len: u64, why: Refusal, error: Option<&windows::core::Error>) {
+    static SAID: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    if SAID[why as usize].fetch_add(1, Ordering::Relaxed) < 4 {
+        let error = error.map(|e| format!(": {:#010x} {}", e.code().0, e.message().trim())).unwrap_or_default();
+        tracing::info!(start = format_args!("{start:#x}"), len, "title memory window not in place: {}{error}", why.why());
+    }
+}
+
+/// LOCAL: sections opened as heaps, by handle and device; `None`: the host
+/// refused, not asked again. Taken after [`VIEWS`] where both are.
+struct Heaps(Vec<(usize, usize, Option<ID3D12Heap>)>);
+// SAFETY: heaps are free-threaded; the list is behind a lock.
+unsafe impl Send for Heaps {}
+
+static HEAPS: std::sync::Mutex<Heaps> = std::sync::Mutex::new(Heaps(Vec::new()));
+
+fn heaps() -> std::sync::MutexGuard<'static, Heaps> {
+    HEAPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// LOCAL: the heap of `section`, opened on `device` at the first asking.
+/// With [`VIEWS`] held: a view the title sees is of the section, so its
+/// handle is open and no other object's.
+fn section_heap(device: &ID3D12Device, section: usize, bytes: u64) -> Result<ID3D12Heap, Option<windows::core::Error>> {
+    let key = device.as_raw() as usize;
+    let mut heaps = heaps();
+    if let Some(known) = heaps.0.iter().find(|h| h.0 == section && h.1 == key) {
+        return known.2.clone().ok_or(None);
+    }
+    let started = std::time::Instant::now();
+    let opened = open(device, From::Section(section));
+    match &opened {
+        Ok(heap) => {
+            VIEW_STATS[7].fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                mb = bytes >> 20,
+                ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
+                "a section of the title's physical pages opened as a host heap, for windows over its views in place; {}",
+                describe(heap)
+            );
+        }
+        Err(e) => tracing::warn!(mb = bytes >> 20, error = %e, "a section of the title's physical pages refused as a host heap: its windows keep their copies"),
+    }
+    heaps.0.push((section, key, opened.as_ref().ok().cloned()));
+    opened.map_err(Some)
+}
+
+/// LOCAL: the section's heap goes from the list (it lives on while a
+/// buffer placed in it does).
+fn section_heap_gone(section: usize) {
+    let gone: Vec<_> = {
+        let mut heaps = heaps();
+        let (gone, kept) = std::mem::take(&mut heaps.0).into_iter().partition(|h| h.0 == section);
+        heaps.0 = kept;
+        gone
+    };
+    drop(gone);
+}
+
+/// LOCAL: title memory `[start, start + len)` in place over the section its
+/// views show, if it is all one run of a section made committed: a buffer
+/// placed at the run's offset in the section's heap, cut on 64 KiB lines.
+pub(crate) fn place_view(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, (Refusal, Option<windows::core::Error>)> {
+    let (heap, offset) = {
+        let v = views();
+        let (section, offset) = match cover_in(&v.views, start as usize, len as usize) {
+            Cover::Run(section, offset) => (section, offset),
+            Cover::Scattered => return Err((Refusal::Scattered, None)),
+            Cover::Holes => return Err((Refusal::Holes, None)),
+            Cover::None => return Err((Refusal::NotPrivate, None)),
+        };
+        let Some(&(_, bytes, committed)) = v.sections.iter().find(|s| s.0 == section) else {
+            return Err((Refusal::Unknown, None));
+        };
+        if !committed {
+            return Err((Refusal::Reserved, None));
+        }
+        let first = offset & !(K64 as u64 - 1);
+        if (offset + len.max(1)).next_multiple_of(K64 as u64) > bytes {
+            return Err((Refusal::Unknown, None));
+        }
+        (section_heap(device, section, bytes).map_err(|e| (Refusal::Host, e))?, (offset, first))
+    };
+    let (offset, first) = offset;
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - first;
+    let buffer = place(device, &heap, first, bytes).map_err(|e| (Refusal::Host, Some(e)))?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - first);
+    Ok(Placed { buffer, heap, gpu, bias: offset - first, view: true })
+}
+
+/// LOCAL: [`place_view`] on the host's device, counted.
+fn place_over_view(start: u64, len: u64) -> Option<Placed> {
+    let host = crate::host::host()?;
+    place_view_counted(&host.device, start, len)
+}
+
+/// LOCAL: [`place_view`], counted in place ([`gone_view`] when it goes) or
+/// turned down with its reason.
+pub(crate) fn place_view_counted(device: &ID3D12Device, start: u64, len: u64) -> Option<Placed> {
+    match place_view(device, start, len) {
+        Ok(placed) => {
+            // (Before the ask stops counting as under way: [`PLACING`].)
+            VIEW_STATS[0].fetch_add(1, Ordering::SeqCst);
+            VIEW_STATS[1].fetch_add(len, Ordering::Relaxed);
+            LONGEST.fetch_max(len, Ordering::Relaxed);
+            shown_note(&placed.buffer);
+            Some(placed)
+        }
+        Err((why, error)) => {
+            let at = match why {
+                Refusal::Scattered => 2,
+                Refusal::Holes => 3,
+                Refusal::Reserved => 4,
+                Refusal::Host => 6,
+                _ => 5,
+            };
+            VIEW_STATS[at].fetch_add(1, Ordering::Relaxed);
+            turned_down(start, len, why, error.as_ref());
+            None
+        }
+    }
+}
+
+/// LOCAL: what [`place_view`] gave is gone (its buffer, by pointer). Slots
+/// still made on the buffer (it outlives the window while a slot holds
+/// it) are made anew as on a let go ([`let_go_view`]).
+pub(crate) fn gone_view(bytes: u64, buffer: usize) {
+    VIEW_STATS[0].fetch_sub(1, Ordering::SeqCst);
+    VIEW_STATS[1].fetch_sub(bytes, Ordering::Relaxed);
+    let mut s = slots();
+    if s.0.get(&buffer).is_some_and(|shown| shown.gone == 0) {
+        s.retire(buffer);
+    }
+}
+
+// LOCAL: heap slots made on a window over a view. A slot keeps the buffer
+// it was made on until its record changes (`HostHeap::mirror`), so a window
+// let go because its view changed would go on being read there, showing
+// the pages from before; its slots are made anew instead.
+
+/// What is known of a buffer of a window over a view.
+struct Shown {
+    /// The heap slots made on it: (host heap, slot).
+    slots: Vec<(usize, u32)>,
+    /// When it was let go (`crate::host::now_ms`, at least 1); 0 while in
+    /// place. Kept a while after: a slot may be made on it by a thread that
+    /// found the window just before ([`slot_shows`]).
+    gone: u64,
+}
+
+/// How long a buffer let go is remembered, in milliseconds.
+const GONE_MS: u64 = 2000;
+
+/// Buffers of windows over views, by pointer; slots to make anew, by host
+/// heap; when buffers let go long ago were last forgotten.
+struct Slots(std::collections::HashMap<usize, Shown>, std::collections::HashMap<usize, Vec<u32>>, u64);
+
+impl Slots {
+    /// The buffer at `buffer` is let go: its slots are to be made anew, and
+    /// any slot made on it from now on too.
+    fn retire(&mut self, buffer: usize) {
+        let now = crate::host::now_ms().max(1);
+        let shown = self.0.entry(buffer).or_insert(Shown { slots: Vec::new(), gone: 0 });
+        shown.gone = now;
+        let slots = std::mem::take(&mut shown.slots);
+        if !slots.is_empty() {
+            VIEW_STATS[9].fetch_add(1, Ordering::Relaxed);
+            for (heap, slot) in slots {
+                self.1.entry(heap).or_default().push(slot);
+            }
+            SLOTS_STALE.store(true, Ordering::Release);
+        }
+        if now >= self.2 + GONE_MS / 2 {
+            self.2 = now;
+            self.0.retain(|_, shown| shown.gone == 0 || now < shown.gone + GONE_MS);
+        }
+        ENTRIES.store(self.0.len(), Ordering::Relaxed);
+    }
+}
+
+static SLOTS: std::sync::LazyLock<std::sync::Mutex<Slots>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Slots(Default::default(), Default::default(), 0)));
+/// Whether [`Slots`]' second part has any.
+static SLOTS_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many buffers [`Slots`]' first part knows (asked without the lock).
+static ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn slots() -> std::sync::MutexGuard<'static, Slots> {
+    SLOTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn shown_note(buffer: &ID3D12Resource) {
+    let mut s = slots();
+    s.0.insert(buffer.as_raw() as usize, Shown { slots: Vec::new(), gone: 0 });
+    ENTRIES.store(s.0.len(), Ordering::Relaxed);
+}
+
+/// LOCAL: slot `slot` of host heap `heap` is made on `buffer`
+/// (`HostHeap::keep`). Nothing unless it is a window over a view; at once
+/// to be made anew if that was let go meanwhile.
+pub(crate) fn slot_shows(heap: usize, slot: u32, buffer: &ID3D12Resource) {
+    if !views_on() || ENTRIES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut s = slots();
+    let Some(shown) = s.0.get_mut(&(buffer.as_raw() as usize)) else {
+        return;
+    };
+    if shown.gone != 0 {
+        s.1.entry(heap).or_default().push(slot);
+        SLOTS_STALE.store(true, Ordering::Release);
+    } else if !shown.slots.contains(&(heap, slot)) {
+        shown.slots.push((heap, slot));
+    }
+}
+
+/// LOCAL: the window over a view on `buffer` was let go
+/// (`crate::shadow::in_place_let_go`): the slots made on it are to be made
+/// anew ([`slots_stale`]).
+pub(crate) fn let_go_view(buffer: &ID3D12Resource) {
+    VIEW_STATS[8].fetch_add(1, Ordering::Relaxed);
+    slots().retire(buffer.as_raw() as usize);
+}
+
+/// LOCAL: the slots of host heap `heap` made on windows over views that
+/// were let go since the last asking: to be made anew from what their
+/// records show now. None while the runtime changes a mapping (the views
+/// it maps are not told yet: a slot made now would get a copy): the next
+/// asking takes them.
+pub(crate) fn slots_stale(heap: usize) -> Vec<u32> {
+    if !SLOTS_STALE.load(Ordering::Acquire) || !crate::watch::changes().is_multiple_of(2) {
+        return Vec::new();
+    }
+    let mut s = slots();
+    let stale = s.1.remove(&heap).unwrap_or_default();
+    if s.1.is_empty() {
+        SLOTS_STALE.store(false, Ordering::Release);
+    }
+    stale
+}
+
+/// LOCAL: host heap `heap` is gone: nothing is to be made in it.
+pub(crate) fn heap_gone(heap: usize) {
+    if ENTRIES.load(Ordering::Relaxed) == 0 && !SLOTS_STALE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut s = slots();
+    s.1.remove(&heap);
+    for shown in s.0.values_mut() {
+        shown.slots.retain(|slot| slot.0 != heap);
+    }
+    if s.1.is_empty() {
+        SLOTS_STALE.store(false, Ordering::Release);
+    }
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -127,7 +496,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, view: false })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -137,13 +506,26 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // LOCAL: under way from before the look at the views until what is
+    // placed is counted ([`PLACING`]).
+    let _placing = views_on().then(Placing::begin);
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
+        // LOCAL: a window over one run of a committed section, in place.
+        if views_on() {
+            if window {
+                return place_over_view(start, len);
+            }
+            turned_down(start, len, Refusal::Buffer, None);
+        }
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
+        if views_on() {
+            turned_down(start, len, Refusal::Most, None);
+        }
         return None;
     }
     let host = crate::host::host()?;
@@ -156,6 +538,9 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            if views_on() {
+                turned_down(start, len, Refusal::NotPrivate, None);
+            }
             None
         }
         Err(Some(e)) => {
@@ -181,7 +566,10 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    // LOCAL: windows over views, or one being placed. (Under way first: one
+    // placed is counted in place before it stops counting as under way.)
+    let views = views_on() && (PLACING.load(Ordering::SeqCst) != 0 || VIEW_STATS[0].load(Ordering::SeqCst) != 0);
+    if !views && STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
@@ -209,6 +597,25 @@ fn say() {
         s[6],
         s[7]
     );
+    // LOCAL: windows over views, apart.
+    if views_on() {
+        let v: Vec<u64> = VIEW_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "title memory in place over the page pool (VICTORY_INPLACE_VIEWS): {} windows {} MB over {} sections opened; turned down: {} scattered pages, \
+             {} with unmapped pages, {} of a reserved section (VICTORY_POOL_COMMIT), {} not known whole, {} refused by the host; \
+             {} let go because their views changed, {} of them shown in heap slots (made anew)",
+            v[0],
+            v[1] >> 20,
+            v[7],
+            v[2],
+            v[3],
+            v[4],
+            v[5],
+            v[6],
+            v[8],
+            v[9]
+        );
+    }
 }
 
 /// What a heap is opened on.
@@ -307,6 +714,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // had it before (it stays mapped: someone may be writing through it).
     v.whole.retain(|w| w.0 != section);
     v.sections.push((section, bytes, committed));
+    // LOCAL: so is a heap opened on the one before.
+    section_heap_gone(section);
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
@@ -315,6 +724,9 @@ pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
+        // LOCAL: and its heap, while the views are held (no window is placed
+        // over the section meanwhile: no view the title sees is of it).
+        section_heap_gone(section);
         at.map(|i| v.whole.swap_remove(i).1)
     };
     if let Some(base) = whole.filter(|&base| base != 0) {
@@ -328,6 +740,9 @@ pub fn title_memory_section_gone(section: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    // LOCAL (gpu-first): the allocation holding it is pool-mapped (`crate::memclass`; off unless
+    // asked for).
+    crate::memclass::pool_mapped(at, len);
     {
         let mut v = views_mut();
         v.views.insert(at, (len, section, offset));
@@ -530,7 +945,8 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
 ///
 /// The section's pages are reserved and the runtime commits each before it
-/// shows it, which holds for every view of the section. The caller holds
+/// shows it, which holds for every view of the section (LOCAL: or the
+/// section is made committed, `VICTORY_POOL_COMMIT`). The caller holds
 /// `crate::watch::title_memory_reading`: until it lets go the title sees
 /// the same pages at `at`.
 pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
@@ -618,8 +1034,8 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 }
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
-/// the host's submissions is touched.
-struct Rig {
+/// the host's submissions is touched. LOCAL (wc-vram): also for `crate::wc_vram`'s tests.
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -639,7 +1055,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -714,7 +1130,7 @@ impl Rig {
 
     /// A compute shader stores, through a root unordered-access view at
     /// `gpu`, the sum of the buffer's first two words in its third.
-    fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
+    pub(crate) fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
         const SOURCE: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { b.Store(8, b.Load(0) + b.Load(4)); }\n";
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; then the
@@ -1266,8 +1682,199 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// LOCAL: [`views_on`] for this thread's test, whatever the switches.
+        pub(crate) static VIEWS_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// LOCAL: [`views_on`] on this thread while held.
+    pub(crate) struct ViewsOn;
+
+    impl Drop for ViewsOn {
+        fn drop(&mut self) {
+            VIEWS_ON.set(false);
+        }
+    }
+
+    pub(crate) fn views_on_here() -> ViewsOn {
+        VIEWS_ON.set(true);
+        ViewsOn
+    }
+
+    /// LOCAL: a section made as `xmem` makes the page pool
+    /// (`VICTORY_POOL_COMMIT=1`: committed), with views at two addresses:
+    /// `pages` pages from the start, and its page 2 again elsewhere (an
+    /// alias). The section, the two addresses. Told to the runtime's record
+    /// as `xmem` tells it.
+    pub(crate) fn committed_section(pages: usize) -> (usize, usize, usize) {
+        // SAFETY: a section and views of the test's own.
+        unsafe {
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let size = 8 * K64;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, size as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let a = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, pages * K64).Value as usize;
+            let b = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, (2 * K64) as u32, K64).Value as usize;
+            assert!(a != 0 && b != 0);
+            title_memory_section(section as usize, size as u64, true);
+            title_memory_view(a, pages * K64, section as usize, 0);
+            title_memory_view(b, K64, section as usize, (2 * K64) as u64);
+            (section as usize, a, b)
+        }
+    }
+
+    /// LOCAL: what [`committed_section`] made goes, as `xmem` lets it go.
+    pub(crate) fn committed_section_gone(section: usize, a: usize, b: usize, pages: usize) {
+        views_gone(a, pages * K64);
+        views_gone(b, K64);
+        title_memory_section_gone(section);
+        // SAFETY: the test's own views and section.
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void });
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut c_void });
+            windows_sys::Win32::Foundation::CloseHandle(section as _);
+        }
+    }
+
+    /// LOCAL: the default adapter if it is a card (as `indirect`'s tests
+    /// take it), for the calls the card's driver answers.
+    fn card() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries and device creation.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            let device = device?;
+            let desc = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+                .ok()?
+                .GetDesc1()
+                .ok()?;
+            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0).then_some(device)
+        }
+    }
+
+    /// LOCAL: a window over one run of a committed section, off the 64 KiB
+    /// lines, is placed over the run's offset in the section's heap: the GPU
+    /// reads what the CPU wrote through another address of the same page,
+    /// and its write is seen at both. What is not one run of a committed
+    /// section is turned down without asking the host, and so is the run
+    /// once its view is gone. On the software adapter and on the card.
+    #[test]
+    fn a_window_over_a_committed_section_shows_its_pages_warp_and_card() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let devices: Vec<(&str, ID3D12Device)> = [("warp", warp()), ("card", card())].into_iter().filter_map(|(n, d)| Some((n, d?))).collect();
+        for (name, device) in devices {
+            eprintln!("a window over a committed section, on the {name}");
+            over_a_committed_section(&device);
+        }
+    }
+
+    fn over_a_committed_section(device: &ID3D12Device) {
+        let device = device.clone();
+        let (section, a, b) = committed_section(4);
+        let (start, len) = ((a + K64 + 0x40) as u64, 2 * K64 as u64);
+        let placed = match place_view(&device, start, len) {
+            Ok(placed) => placed,
+            Err((Refusal::Host, Some(e))) => {
+                // A driver that refuses a section as a heap: nothing to try.
+                eprintln!("the section refused as a heap: {e}");
+                committed_section_gone(section, a, b, 4);
+                return;
+            }
+            Err(e) => panic!("not placed: {e:?}"),
+        };
+        assert!(placed.view);
+        assert_eq!(placed.bias, 0x40);
+        // SAFETY: a live buffer.
+        unsafe {
+            assert_eq!(placed.gpu, placed.buffer.GetGPUVirtualAddress() + 0x40);
+            assert_eq!(placed.buffer.GetDesc().Width, 3 * K64 as u64, "pages 1 to 3 of the section");
+        }
+        let mut rig = Rig::new(&device).unwrap();
+        // Page 2 is at `a + 2 pages`, at `b`, and at the buffer's second page.
+        fill(b as *mut u8, K64, 9);
+        let got = rig.fetch(&placed.buffer, K64 as u64, K64).unwrap();
+        assert!(same(b as *const u8, &got), "the GPU reads what the CPU wrote through the alias");
+        assert!(same((a + 2 * K64) as *const u8, &got));
+        rig.store(&placed.buffer, placed.bias, &[0x5a; 64]).unwrap();
+        assert!(same(start as *const u8, &[0x5a; 64]), "the GPU's write is at the window's address");
+        rig.store(&placed.buffer, K64 as u64 + 8, &[0xc3; 16]).unwrap();
+        assert!(same((b + 8) as *const u8, &[0xc3; 16]), "and at the alias");
+        // The heap is opened once per section.
+        let again = place_view(&device, start, K64 as u64).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+        assert_eq!(again.heap.as_raw(), placed.heap.as_raw());
+        drop(again);
+        // (Records only, at addresses nothing has.) Over a view's end into
+        // nothing: holes; over two views of pages that do not follow each
+        // other in the section: scattered.
+        let holes = 0x7_9200_0000usize;
+        title_memory_view(holes, K64, section, 0);
+        assert!(matches!(place_view(&device, holes as u64, 2 * K64 as u64), Err((Refusal::Holes, None))));
+        views_gone(holes, K64);
+        let scattered = 0x7_9000_0000usize;
+        title_memory_view(scattered, K64, section, 0);
+        title_memory_view(scattered + K64, K64, section, (5 * K64) as u64);
+        assert!(matches!(place_view(&device, scattered as u64, 2 * K64 as u64), Err((Refusal::Scattered, None))));
+        assert!(place_view(&device, (scattered + K64) as u64, K64 as u64).is_ok(), "a page of its own is one run");
+        views_gone(scattered, 2 * K64);
+        // A reserved section is not opened.
+        let reserved = 0x7_9100_0000usize;
+        title_memory_section(0x5151, 8 * K64 as u64, false);
+        title_memory_view(reserved, K64, 0x5151, 0);
+        assert!(matches!(place_view(&device, reserved as u64, K64 as u64), Err((Refusal::Reserved, None))));
+        views_gone(reserved, K64);
+        title_memory_section_gone(0x5151);
+        // Its view gone (the runtime unmaps it): turned down.
+        views_gone(a, 4 * K64);
+        assert!(place_view(&device, start, len).is_err());
+        drop(placed);
+        committed_section_gone(section, a, b, 4);
+        assert!(heaps().0.iter().all(|h| h.0 != section), "the section's heap is forgotten with it");
+    }
+
+    /// LOCAL: slots made on a window over a view are told to be made anew
+    /// once it is let go, once, for their own heap.
+    #[test]
+    fn slots_on_a_window_let_go_are_made_anew() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = warp() else { return };
+        let _on = views_on_here();
+        let (section, a, b) = committed_section(4);
+        let placed = place_view_counted(&device, a as u64, K64 as u64).expect("placed");
+        slot_shows(0x1000, 7, &placed.buffer);
+        slot_shows(0x1000, 7, &placed.buffer);
+        slot_shows(0x2000, 9, &placed.buffer);
+        assert!(slots_stale(0x1000).is_empty(), "nothing let go yet");
+        let_go_view(&placed.buffer);
+        // A slot made on it by a thread that found the window just before.
+        slot_shows(0x1000, 8, &placed.buffer);
+        {
+            // Not while the runtime changes a mapping: the views it maps
+            // are not told yet.
+            let _changing = crate::title_memory_remapping();
+            assert!(slots_stale(0x1000).is_empty());
+        }
+        assert_eq!(slots_stale(0x1000), vec![7, 8]);
+        assert!(slots_stale(0x1000).is_empty());
+        // A heap that goes has nothing made anew.
+        heap_gone(0x2000);
+        assert!(slots_stale(0x2000).is_empty());
+        gone_view(K64 as u64, placed.buffer.as_raw() as usize);
+        drop(placed);
+        // A window that goes without a let go, its buffer held by a slot:
+        // the slot is made anew too.
+        let placed = place_view_counted(&device, a as u64, K64 as u64).expect("placed");
+        slot_shows(0x1000, 3, &placed.buffer);
+        gone_view(K64 as u64, placed.buffer.as_raw() as usize);
+        assert_eq!(slots_stale(0x1000), vec![3]);
+        drop(placed);
+        committed_section_gone(section, a, b, 4);
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

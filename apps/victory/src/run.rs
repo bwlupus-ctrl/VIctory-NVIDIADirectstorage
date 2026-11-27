@@ -64,6 +64,8 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // LOCAL (page-kinds): register the read-only meter with the original build identity.
+    victory_hle::modules::pagekinds::install(image.base(), image.info().size_of_image as usize, &hash);
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in

@@ -43,6 +43,54 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// LOCAL (upstream-port 77e13a9): how long draws have waited for it so
+    /// far, in microseconds ([`wait_once`]).
+    waited_us: AtomicU64,
+    /// LOCAL (upstream-port 672442b, 35c1560): why this pipeline is left out on purpose
+    /// ([`left_out`]); it is never queued nor made.
+    left_out: Option<&'static str>,
+}
+
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`; `VICTORY_SKIP_PIPELINES` drops draws in
+/// diagnostics builds only, after the pipeline was made). (upstream 672442b)
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a group. Upstream
+/// found that on hosts of 32-lane waves they leave whole tiles of open water dark (around boats,
+/// along shores, under bridges) and take about 15 ms of the card a frame; left out there, the
+/// water has no light of its own depth (darker, bluer) and no blocks. `VICTORY_WATER_LIGHT=1`
+/// runs them. (upstream 35c1560.) LOCAL: our paired wave64 form (`with_paired_lanes`) is what
+/// translates them on a 32-lane host here, and the paired form was not the one measured upstream;
+/// the leave-out applies to any 32-lane host all the same (`VICTORY_WATER_LIGHT=1` to A/B).
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+    }
+    None
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -59,7 +107,9 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let left_out = left_out(&shaders);
         Pending {
+            left_out,
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
@@ -68,6 +118,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +143,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(format!("left out on purpose: {why}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -159,6 +213,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -174,6 +231,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -181,6 +241,9 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.left_out.is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
@@ -200,6 +263,21 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// LOCAL (upstream-port 77e13a9; the problem of fxceless issue #1181):
+/// whether one pipeline is waited for at most one budget over the whole run,
+/// not one budget every frame. A pipeline whose make takes longer than the
+/// budget (a driver compile of tens of seconds, or one that never ends)
+/// otherwise cost the whole budget in every frame in which a draw asked for
+/// it: with `VICTORY_PIPELINE_WAIT_MS=10000` the picture stood still while
+/// the thing drawn with it was in view, and moved again when the camera
+/// turned away. After its budget its draws are dropped until it is made, as
+/// with any pipeline past the frame's budget. On by default;
+/// `VICTORY_PIPELINE_WAIT_ONCE=0` waits as before.
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -207,6 +285,17 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    // LOCAL (upstream-port 77e13a9): what is left of this pipeline's own
+    // budget ([`wait_once`]).
+    let own = if wait_once() {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -217,7 +306,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -238,6 +327,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if wait_once() && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=0: waited for every frame)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -363,6 +462,9 @@ static AVAILABLE: Condvar = Condvar::new();
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
+    if p.left_out.is_some() {
+        return;
+    }
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -480,6 +582,33 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipeline left out on purpose is never queued, never made, and named so (upstream f149e26).
+    #[test]
+    fn pipelines_left_out_are_never_queued() {
+        let mut p = Pending::new(Vec::new(), None);
+        assert!(p.left_out.is_none());
+        p.left_out = Some("named in VICTORY_LEAVE_OUT, left out");
+        let p = Arc::new(p);
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        early(&p);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            missing(&p).as_deref(),
+            Some("left out on purpose: named in VICTORY_LEAVE_OUT, left out")
+        );
+    }
+
+    #[test]
+    fn water_light_hashes_are_the_two_tiled_programs() {
+        assert_eq!(WATER_LIGHT, ["5dc3b25986622949", "6f225b641c5b0708"]);
+        assert!(WATER_LIGHT.iter().all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())));
+        // No shaders: nothing to leave out.
+        assert!(!water_light_left_out(&[]));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

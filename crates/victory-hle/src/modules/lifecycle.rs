@@ -377,6 +377,8 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // LOCAL: the read map is written once more on the way out.
+    super::read_map::flush();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

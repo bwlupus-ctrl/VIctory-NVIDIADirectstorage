@@ -10,6 +10,8 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    // LOCAL (heap-probe): the title's code, for telling its reads from ours (`VICTORY_HEAP_PROBE=1`).
+    victory_gpu::heapprobe::add_title_image(base, true);
     crate::image_watch::start(base);
 }
 
@@ -28,6 +30,8 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    // LOCAL (heap-probe): as for the main image.
+    victory_gpu::heapprobe::add_title_image(base, false);
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));

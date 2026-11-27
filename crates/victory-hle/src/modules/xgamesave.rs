@@ -284,6 +284,9 @@ fn commit(
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
+        // LOCAL (heap-probe): the kernel's read of `data` (title memory) fails on a page the probe
+        // made inaccessible (`VICTORY_HEAP_PROBE=1`; off: nothing).
+        let _probe = victory_gpu::heapprobe::emulator_reading(data.as_ptr() as usize, data.len());
         let mut file = std::fs::File::create(path)?;
         file.write_all(data)?;
         file.sync_all()

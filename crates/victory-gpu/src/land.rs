@@ -115,7 +115,27 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    // LOCAL (upstream-port 2d1dc38): the read-backs part of the landing line, split.
+    /// Parts of [`READ_BACKS`]: textures shaders wrote that the title reads
+    /// (`texback::land`), buffer read-backs (map and copy into title memory),
+    /// and the flight's card plan and own work told done.
+    pub(crate) const RB_TEXTURES: usize = 26;
+    pub(crate) const RB_BUFFERS: usize = 27;
+    pub(crate) const RB_DONE: usize = 28;
+    /// Counts for those: texture read-backs landed, buffer read-backs and
+    /// their bytes.
+    pub(crate) const RB_TEXTURE_COUNT: usize = 29;
+    pub(crate) const RB_BUFFER_COUNT: usize = 30;
+    pub(crate) const RB_BUFFER_BYTES: usize = 31;
+    /// Writing texture read-backs into title memory (`texback::write`, on
+    /// its own thread unless `VICTORY_TEXBACK_ASYNC=0`): waiting for the
+    /// locks against mapping changes, the work after, read-backs written,
+    /// and those replaced by a newer one before they were.
+    pub(crate) const TB_WAIT: usize = 32;
+    pub(crate) const TB_WORK: usize = 33;
+    pub(crate) const TB_WRITTEN: usize = 34;
+    pub(crate) const TB_REPLACED: usize = 35;
+    pub(crate) const COUNT: usize = 36;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -171,6 +191,26 @@ pub(crate) fn log(frames: f64) {
         ms(stat::READ_BACKS),
         ms(stat::TOLD),
         ms(stat::REST),
+    );
+    // LOCAL (upstream-port 2d1dc38)
+    tracing::info!(
+        "read-backs and lists per frame: textures shaders wrote {:.2} ms ({:.1} landed), buffer read-backs {:.2} ms \
+         ({:.1} of them, {:.2} MB), card plans and own work done {:.2} ms",
+        ms(stat::RB_TEXTURES),
+        s[stat::RB_TEXTURE_COUNT],
+        ms(stat::RB_BUFFERS),
+        s[stat::RB_BUFFER_COUNT],
+        mb(s[stat::RB_BUFFER_BYTES]),
+        ms(stat::RB_DONE),
+    );
+    tracing::info!(
+        "texture read-backs written per frame (VICTORY_TEXBACK_ASYNC={}): {:.1}, {:.1} replaced by a newer one first; \
+         waiting for the mapping locks {:.2} ms, tiling and writing {:.2} ms",
+        crate::texback::mode(),
+        s[stat::TB_WRITTEN],
+        s[stat::TB_REPLACED],
+        ms(stat::TB_WAIT),
+        ms(stat::TB_WORK),
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \
@@ -562,7 +602,18 @@ pub(crate) unsafe fn piece(
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
+    let put = unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) };
+    // LOCAL (gpu-first): by class (`VICTORY_CLASS_STATS`), and the merge's reads of title memory
+    // when that is write-combined (it reads the dwords it puts: counted as the bytes put, at the
+    // piece's address; through a view of ours the same pages are read).
+    if crate::memclass::stats_on() {
+        crate::memclass::add(crate::memclass::M::BackPieces, title, 1);
+        crate::memclass::add(crate::memclass::M::BackBytes, title, put);
+    }
+    if crate::memclass::reads_on() && put != 0 {
+        crate::memclass::wc_read(title, put as usize);
+    }
+    put
 }
 
 /// [`piece`], and whether a view of ours is looked for.

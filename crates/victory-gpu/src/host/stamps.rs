@@ -172,6 +172,8 @@ mod tests {
             unsafe {
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
+                // LOCAL (wc-vram): for `writer_fence`.
+                super::signalled(*submitted);
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
                 WaitForSingleObject(host.event, INFINITE);
             }

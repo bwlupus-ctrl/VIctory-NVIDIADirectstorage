@@ -203,6 +203,13 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// LOCAL (port of cool_fox f4b48ad).
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

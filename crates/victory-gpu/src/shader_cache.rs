@@ -64,6 +64,10 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_BVH_MISS",
+            // LOCAL (upstream-port 77e13a9): colours and image stores with NaN made 0.
+            "VICTORY_NAN_SCRUB",
+            // LOCAL (upstream-port 77e13a9): table views that move halves as integers.
+            "VICTORY_HALF_VIEWS",
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
@@ -76,12 +80,34 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // LOCAL: the paired wave64 form (`victory_shader::emit`) is
+            // chosen by it too.
+            "VICTORY_WAVE_PAIRS",
+            // LOCAL (ports of DexNom/VIctory 76749ce, b8ff22e, 5f4c3df): the
+            // restored wave64 masks, integer views and packed mask words.
+            "VICTORY_WAVE64_MASK_COPIES",
+            "VICTORY_UINT_SRVS",
+            "VICTORY_PACKED_MASK",
+            // LOCAL (polska): the 16-bit masks around the f16 conversions.
+            "VICTORY_F16_FIX",
+            // LOCAL (scarlett-port): d16 loads through integer views keep their 16 bits.
+            "VICTORY_D16_BITS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.
@@ -116,6 +142,19 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    // LOCAL: a shader a switch names by hash (`VICTORY_SANITIZE_HASHES`,
+    // `VICTORY_PACKED_MASK_OFF`) translates differently from its cached form
+    // and is neither read from the cache nor kept in it: those switches are
+    // not in the cache key, so listing a shader translates only that one.
+    if victory_shader::emit::any_by_hash() {
+        let hash = blake3::hash(container).to_hex();
+        let hash = &hash.as_str()[..16];
+        if victory_shader::emit::by_hash(hash) {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(hash, "shader translated apart from the cache: a switch names it by hash");
+            return victory_shader::emit::translate_hashed(container, hash).map_err(|e| e.to_string());
+        }
+    }
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
@@ -177,7 +216,9 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+// LOCAL: VSH2 adds `read_only_root_uavs` after `root_uavs`; VSH3 (upstream-port
+// 77e13a9) adds `half_views` after `root_indexed_views`.
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -252,7 +293,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs, &s.read_only_root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -267,6 +308,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         ] {
             word(&mut out, value);
         }
+    }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
     }
     out
 }
@@ -325,6 +371,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let read_only_root_uavs = r.list()?;
+    // (a slot the shader does not bind cannot be read only: a damaged entry)
+    if !read_only_root_uavs.iter().all(|s| root_uavs.contains(s)) {
+        return None;
+    }
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -336,6 +387,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -345,7 +401,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        read_only_root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -372,7 +430,8 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
-            root_uavs: vec![1],
+            root_uavs: vec![1, 4],
+            read_only_root_uavs: vec![4],
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,
@@ -380,6 +439,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
@@ -404,7 +464,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -435,5 +495,16 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // An entry of the form before `read_only_root_uavs` is not read.
+        let mut stale = bytes.clone();
+        stale[..4].copy_from_slice(b"VSH1");
+        assert_eq!(decode(&stale), None);
+        // Nor one of the form before `half_views` (VSH2).
+        stale[..4].copy_from_slice(b"VSH2");
+        assert_eq!(decode(&stale), None);
+        // Nor one whose read-only root UAVs are not among its root UAVs.
+        let mut odd = shader();
+        odd.read_only_root_uavs = vec![7];
+        assert_eq!(decode(&encode(&odd)), None);
     }
 }

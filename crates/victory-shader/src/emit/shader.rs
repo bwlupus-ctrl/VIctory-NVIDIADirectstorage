@@ -24,6 +24,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// LOCAL (port of cool_fox f4b48ad): the same table of strides and format
+/// kinds as [`SLOT_STRIDES`], bound for shaders that only inspect views from
+/// descriptor tables (`RootType::Table`): the integer kind of a typed view a
+/// `_d16` access goes through (the face network's UINT views). Kept distinct
+/// from [`SLOT_STRIDES`] so the host binds the table without running the
+/// full bindless heap buffer sweep.
+pub const SLOT_TABLE_STRIDES: u8 = 252;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -97,6 +104,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil: HLSL's `[earlydepthstencil]` (no `SFI0` bit).
+    pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -193,6 +202,18 @@ pub fn raw_views() -> u32 {
     RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// LOCAL (`VICTORY_SANITIZE_HASHES`): where among a `dx.op` call's operands
+/// (after the opcode) the values it stores are: textureStore (67), bufferStore
+/// (69), rawBufferStore (140) and, in a pixel shader, storeOutput (5).
+fn stored_values(opcode: u32, pixel: bool) -> Option<std::ops::Range<usize>> {
+    match opcode {
+        5 if pixel => Some(3..4),
+        67 => Some(4..8),
+        69 | 140 => Some(3..7),
+        _ => None,
+    }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -220,6 +241,10 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// LOCAL (`VICTORY_SANITIZE_HASHES`, a test switch): values stored through
+    /// views, and a pixel shader's render-target writes, have NaN and
+    /// infinities replaced by 0 ([`Shader::op`]).
+    pub sanitize: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -276,6 +301,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            sanitize: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -307,6 +333,19 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // LOCAL (`VICTORY_SANITIZE_HASHES`): the stored values made finite.
+        let finite;
+        let args = match self.sanitize.then(|| stored_values(opcode, self.pixel)).flatten() {
+            Some(values) if values.end <= args.len() => {
+                let mut all = args.to_vec();
+                for x in &mut all[values] {
+                    *x = self.finite(block, *x);
+                }
+                finite = all;
+                &finite[..]
+            }
+            _ => args,
+        };
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -317,6 +356,47 @@ impl Shader {
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         self.m.call(block, f, all)
+    }
+
+    /// LOCAL (per-slot copy-back, after DexNom/VIctory bc3cd4b's
+    /// `written_root_uavs`): the root UAVs whose handle is only the resource
+    /// of loads and size queries (`dx.op` BufferLoad 68, GetDimensions 72,
+    /// RawBufferLoad 139) and has no other use. Anything else counts as a
+    /// write: stores, atomics, a handle picked by a select or a join, any use
+    /// not known here.
+    pub fn read_only_root_uavs(&self) -> Vec<u8> {
+        const READS: [i64; 3] = [68, 72, 139];
+        self.root_uavs
+            .iter()
+            .filter(|&&(_, h)| !self.m.may_write_through(h, &READS))
+            .map(|r| r.0)
+            .collect()
+    }
+
+    /// LOCAL (`VICTORY_SANITIZE_HASHES`): `x`, or 0 where it is a NaN or an
+    /// infinity, when it is the result of float arithmetic
+    /// ([`Module::float_result`]): a float, or an integer holding a float's
+    /// bits (what the lowering stores float results as), tested by those bits.
+    /// Other values stay: constants, integers computed as integers, and data
+    /// stored as it was loaded (an integer 0xFFFF_FFFF read through a float
+    /// view, say), whatever its bits. Not followed: a join or select with any
+    /// input that is not such a result (it stays as it is).
+    fn finite(&mut self, block: usize, x: V) -> V {
+        use super::bitcode::{Bin, Cast, pred};
+        let (i32t, f32t) = (self.t.i32, self.t.f32);
+        let ty = self.m.type_of(x);
+        let (bits, zero) = if ty == f32t && self.m.float_result(x, false) {
+            (self.m.cast(block, Cast::Bitcast, x, i32t), self.m.f32(0))
+        } else if ty == i32t && self.m.float_result(x, true) {
+            (x, self.m.i32(0))
+        } else {
+            return x;
+        };
+        // All exponent bits set: an infinity or a NaN.
+        let exponent = self.m.i32(0x7F80_0000);
+        let e = self.m.bin(block, Bin::And, bits, exponent);
+        let fine = self.m.cmp(block, pred::NE, e, exponent);
+        self.m.select(block, fine, x, zero)
     }
 
     /// The handle of the user-data constant buffer, made in the entry block.
@@ -999,5 +1079,77 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bitcode::Attr;
+    use super::Shader;
+
+    /// LOCAL (after DexNom/VIctory bc3cd4b): only a root UAV that loads and size queries alone
+    /// use is read only; a store, an atomic or a handle picked by a condition is a write.
+    #[test]
+    fn only_root_uavs_read_through_their_handle_are_read_only() {
+        let mut s = Shader::new(false);
+        let input = s.root_uav_handle(1);
+        let output = s.root_uav_handle(2);
+        let counter = s.root_uav_handle(3);
+        let picked = [s.root_uav_handle(4), s.root_uav_handle(5)];
+        let sized = s.root_uav_handle(6);
+        let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+        let undef = s.m.undef(s.t.i32);
+        let (res_ret, i32t, void, e) = (s.t.res_ret, s.t.i32, s.t.void, s.entry);
+        for h in [input, output] {
+            s.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res_ret, 139, &[h, zero, undef, mask, align]);
+        }
+        let stored = [output, zero, undef, one, undef, undef, undef, mask, align];
+        s.op(e, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &stored);
+        s.op(e, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[counter, zero, zero, undef, undef, one]);
+        let cond = s.m.bool(true);
+        let h = s.m.select(e, cond, picked[0], picked[1]);
+        s.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res_ret, 139, &[h, zero, undef, mask, align]);
+        let dims = s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        s.op(e, "getDimensions", Attr::ReadOnly, dims, 72, &[sized, undef]);
+        assert_eq!(s.read_only_root_uavs(), [1, 6]);
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::super::bitcode::{Attr, Bin, Cast};
+    use super::Shader;
+
+    /// LOCAL (`VICTORY_SANITIZE_HASHES`): of a textureStore (handle, three coordinates, four
+    /// values, mask) only the values are tested, and of those only float results: a float
+    /// loaded and stored as it is keeps its bits, as does a coordinate.
+    #[test]
+    fn sanitized_texture_stores_test_only_stored_float_results() {
+        let mut s = Shader::new(false);
+        s.sanitize = true;
+        let e = s.entry;
+        let h = s.root_uav_handle(1);
+        let (i32t, res_ret, void) = (s.t.i32, s.t.res_ret, s.t.void);
+        let (zero, mask, align, all) = (s.m.i32(0), s.m.i8(1), s.m.i32(4), s.m.i8(0xF));
+        let undef = s.m.undef(i32t);
+        let load = s.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res_ret, 139, &[h, zero, undef, mask, align]);
+        let loaded = s.m.extract(e, load, 0);
+        let sum = s.m.bin(e, Bin::Add, loaded, loaded);
+        let coord = s.m.cast(e, Cast::Bitcast, sum, i32t);
+        let args = [h, coord, coord, undef, sum, loaded, sum, sum, all];
+        let call = s.op(e, "textureStore.f32", Attr::NoUnwind, void, 67, &args);
+        let got = s.m.call_args(call).unwrap()[1..].to_vec();
+        assert_eq!(got[..4], args[..4], "the handle and coordinates");
+        assert_ne!(got[4], sum, "a float result is tested");
+        assert_eq!(got[5], loaded, "loaded data is not");
+        assert_eq!(got[8], all);
+        // The raw store of a float result's bits is tested; of loaded bits, not.
+        let raw = s.m.cast(e, Cast::Bitcast, loaded, i32t);
+        let stored = [h, zero, undef, coord, raw, undef, undef, mask, align];
+        let call = s.op(e, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &stored);
+        let got = s.m.call_args(call).unwrap()[1..].to_vec();
+        assert_ne!(got[3], coord);
+        assert_eq!(got[4], raw);
+        assert_eq!(got[..3], stored[..3]);
     }
 }

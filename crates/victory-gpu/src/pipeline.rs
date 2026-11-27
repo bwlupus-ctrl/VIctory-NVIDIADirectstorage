@@ -490,10 +490,33 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    // LOCAL (upstream-port): `VICTORY_SKIP_PIPELINES_FILE=<path>`: hashes
+    // read from a file (same format: comma-separated, whitespace and new
+    // lines allowed), merged with `VICTORY_SKIP_PIPELINES`, so a long list
+    // (scripts/rt_off_hashes.txt, 1,034 hashes) needs no 17 KB variable.
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let mut set: std::collections::HashSet<String> = parse_skip_hashes(&value).into_iter().collect();
+        if let Some(path) = std::env::var_os("VICTORY_SKIP_PIPELINES_FILE").filter(|v| !v.is_empty()) {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    // (A byte order mark or line ends are not part of a hash.)
+                    set.extend(parse_skip_hashes(&text.replace(['\r', '\n', '\u{feff}'], ",")));
+                    tracing::info!(
+                        file = %path.to_string_lossy(),
+                        hashes = set.len(),
+                        "VICTORY_SKIP_PIPELINES_FILE: shader hashes to skip"
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    file = %path.to_string_lossy(),
+                    %error,
+                    "VICTORY_SKIP_PIPELINES_FILE could not be read"
+                ),
+            }
+        }
+        set
     });
     if hashes.is_empty() {
         return None;

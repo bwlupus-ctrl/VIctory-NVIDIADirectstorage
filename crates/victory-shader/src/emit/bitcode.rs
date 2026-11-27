@@ -326,6 +326,87 @@ impl Module {
         }
     }
 
+    /// LOCAL (per-slot copy-back): whether anything in the module may write
+    /// through the resource handle `handle`: every use of it counts except as
+    /// the resource operand (the first after the opcode) of a `dx.op` call
+    /// whose opcode is one of `reads`. A use in any other instruction (a
+    /// select or phi of handles, say) counts too.
+    pub fn may_write_through(&self, handle: V, reads: &[i64]) -> bool {
+        self.insts.iter().any(|inst| match &inst.op {
+            Op::Call(_, args) => {
+                if !args.contains(&handle) {
+                    return false;
+                }
+                let read = args.len() > 1
+                    && args[1] == handle
+                    && !args[2..].contains(&handle)
+                    && args.first().and_then(|&op| self.int_value(op)).is_some_and(|op| reads.contains(&op));
+                !read
+            }
+            Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+                *a == handle || *b == handle
+            }
+            Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => *a == handle,
+            Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => [a, b, c].contains(&&handle),
+            Op::Phi(incoming) => incoming.iter().any(|(v, _)| *v == handle),
+            Op::Gep(_, a, rest) => *a == handle || rest.contains(&handle),
+        })
+    }
+
+    /// LOCAL (tests): the operands of the call `v` (the `dx.op` opcode first).
+    #[cfg(test)]
+    pub fn call_args(&self, v: V) -> Option<&[V]> {
+        let V::Inst(i) = v else { return None };
+        match &self.insts[i as usize].op {
+            Op::Call(_, args) => Some(args),
+            _ => None,
+        }
+    }
+
+    /// LOCAL (`VICTORY_SANITIZE_HASHES`): whether `v` is the result of float
+    /// arithmetic (`bits`: the bits of one, as an integer). A float operation,
+    /// a conversion to float or a `dx.op` call qualifies; a float that is only
+    /// bits loaded or bitcast from an integer does not (data stored as it was
+    /// read keeps its bits). A select or join qualifies when every input that
+    /// is not a constant does. Only `bits` follows a bitcast, to its float.
+    pub fn float_result(&self, v: V, bits: bool) -> bool {
+        self.arith(v, bits, 16) == Some(true)
+    }
+
+    /// [`Self::float_result`]: `None` for a constant (neither way).
+    fn arith(&self, v: V, bits: bool, depth: u32) -> Option<bool> {
+        let V::Inst(i) = v else {
+            return if matches!(v, V::Const(_)) { None } else { Some(false) };
+        };
+        let Some(depth) = depth.checked_sub(1) else {
+            return Some(false);
+        };
+        let all = |xs: &mut dyn Iterator<Item = V>| {
+            let mut any = None;
+            for x in xs {
+                match self.arith(x, bits, depth) {
+                    Some(false) => return Some(false),
+                    Some(true) => any = Some(true),
+                    None => {}
+                }
+            }
+            any
+        };
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::Bitcast, x) => Some(bits && self.arith(*x, false, depth) == Some(true)),
+            _ if bits => match &self.insts[i as usize].op {
+                Op::Select(_, a, b) => all(&mut [*a, *b].into_iter()),
+                Op::Phi(incoming) => all(&mut incoming.iter().map(|x| x.0)),
+                _ => Some(false),
+            },
+            Op::Bin(..) | Op::Call(..) => Some(true),
+            Op::Cast(op, _) => Some(matches!(op, Cast::UiToFp | Cast::SiToFp)),
+            Op::Select(_, a, b) => all(&mut [*a, *b].into_iter()),
+            Op::Phi(incoming) => all(&mut incoming.iter().map(|x| x.0)),
+            _ => Some(false),
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

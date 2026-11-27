@@ -255,6 +255,51 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// LOCAL (scarlett-port): whether the pipeline this thread makes has
+    /// static samplers ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// LOCAL (scarlett-port, scarlett-fox bc264a4 from foxhound 7fa0e95): the
+/// pipelines this thread makes while the guard lives have static samplers.
+/// With `VICTORY_SAMPLERS_MADE` (on unless `0`) they are compiled every run,
+/// never loaded from or stored in the library.
+///
+/// Why: the driver keeps static samplers in a table of its own and bakes
+/// their places in that table into the pipeline. A pipeline loaded from a
+/// library another run wrote keeps that run's places, which may be other
+/// samplers (filters, address modes, comparisons): banded, posterized colour
+/// grading in some runs only (measured on an RTX 4070 SUPER). The driver's
+/// own cache keeps the compile quick.
+pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(samplers))
+}
+
+/// See [`with_static_samplers`]; the setting before it comes back on drop.
+pub(crate) struct StaticSamplers(bool);
+
+impl Drop for StaticSamplers {
+    fn drop(&mut self) {
+        STATIC_SAMPLERS.set(self.0);
+    }
+}
+
+/// `VICTORY_SAMPLERS_MADE` (default on; `0` turns it off): see
+/// [`with_static_samplers`].
+fn samplers_made() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| samplers_made_from(std::env::var_os("VICTORY_SAMPLERS_MADE").as_deref()))
+}
+
+fn samplers_made_from(value: Option<&std::ffi::OsStr>) -> bool {
+    // LOCAL (scarlett-port): opt-in (`=1`) after review — recompiling every
+    // static-sampler pipeline each run costs stutter; the driver bug is unproven here.
+    value.is_some_and(|v| v == "1")
+}
+
+/// Whether a pipeline bypasses the library (neither loaded nor stored).
+fn bypasses_library(static_samplers: bool, switch: bool) -> bool {
+    static_samplers && switch
 }
 
 /// Names the pipeline this thread makes next.
@@ -520,7 +565,9 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    // LOCAL (scarlett-port, `VICTORY_SAMPLERS_MADE`): every load and store of
+    // the library goes through here (graphics, mesh, compute, streams).
+    let Some(library) = library().filter(|_| !bypasses_library(STATIC_SAMPLERS.get(), samplers_made())) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
@@ -783,6 +830,30 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_sampler_pipelines_bypass_the_library_unless_switched_off() {
+        use std::ffi::OsStr;
+        // (LOCAL, scarlett-port) Opt-in since review: off unless "1".
+        assert!(!samplers_made_from(None));
+        assert!(samplers_made_from(Some(OsStr::new("1"))));
+        assert!(!samplers_made_from(Some(OsStr::new("0"))));
+        assert!(bypasses_library(true, true));
+        assert!(!bypasses_library(true, false));
+        assert!(!bypasses_library(false, true));
+        // The guard sets the thread's flag and restores the earlier one.
+        assert!(!STATIC_SAMPLERS.get());
+        {
+            let _outer = with_static_samplers(true);
+            assert!(STATIC_SAMPLERS.get());
+            {
+                let _inner = with_static_samplers(false);
+                assert!(!STATIC_SAMPLERS.get());
+            }
+            assert!(STATIC_SAMPLERS.get());
+        }
+        assert!(!STATIC_SAMPLERS.get());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

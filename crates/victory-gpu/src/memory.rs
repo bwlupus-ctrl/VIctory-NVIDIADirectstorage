@@ -393,7 +393,22 @@ impl Memory {
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        let Some(shadow) = crate::shadow::by_address(at as u64, ARENA) else {
+            return false;
+        };
+        // LOCAL (polska, port of POLSKAGUROM 93f36ba; `VICTORY_BUFFER_TIERS=1`): what
+        // the card writes in an arena stays there (the module's "what comes back"), so
+        // its copy needs no hashes, compares or fetches (`Shadow::skips_readback`).
+        if crate::shadow::buffer_tiers_on() {
+            shadow.set_tier(crate::shadow::BufferTier::Tier1GpuPrivate);
+            crate::shadow::register_non_uma_range(
+                at as u64,
+                ARENA,
+                crate::shadow::BufferTier::Tier1GpuPrivate,
+                crate::shadow::RangeTag::BvhArena,
+            );
+        }
+        let Some(n) = self.number(shadow) else {
             return false;
         };
         self.arenas.push((n, at));

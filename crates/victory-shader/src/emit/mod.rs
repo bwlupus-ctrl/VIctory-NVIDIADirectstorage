@@ -2,7 +2,11 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it. LOCAL (port of
+//! Neptune_VI's paired form): on a host of 32-lane waves, a wave64 program
+//! that no form in 32-lane waves gives as the console runs it takes the
+//! paired form instead (`paired`): a host wave for each console wave, two
+//! console lanes a thread, half the threads.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -122,7 +126,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -155,6 +159,86 @@ pub fn loop_limit() -> u32 {
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` of a console pixel program: the
+/// depth and stencil tests (and the depth write) run before the program, as
+/// HLSL's `[earlydepthstencil]` asks.
+pub(crate) const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+/// `DB_SHADER_CONTROL`'s Z_EXPORT_ENABLE, STENCIL_TEST_VAL_EXPORT_ENABLE and
+/// STENCIL_OP_VAL_EXPORT_ENABLE: the program writes depth or stencil.
+const DEPTH_STENCIL_EXPORT: u32 = 0b111;
+
+#[cfg(test)]
+thread_local! {
+    /// [`early_depth`] for the tests of one thread.
+    static EARLY_DEPTH_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_EARLY_DEPTH=1`: a pixel program whose console code tests depth and
+/// stencil before it runs ([`DEPTH_BEFORE_SHADER`]) gets D3D12's early
+/// depth-stencil test too (DXIL shader flag ForceEarlyDepthStencil). Without
+/// it the host tests after the program wherever the program writes to
+/// unordered views or discards, and its writes to unordered views land for
+/// pixels the depth test then rejects. The title's transparent pass (glass)
+/// keeps its nearest depth and motion with 64-bit atomics into a texture that
+/// a later full-screen draw writes into the scene depth and motion vectors
+/// with the depth test off: glass behind a character's hair took the hair's
+/// place there, and the heat-haze and in-scattering pass
+/// (731a39171b568298), which picks its effect by each pixel's distance, read
+/// those pixels at the glass's (or the world's beyond it) distance. Off by
+/// default. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does, while it is on).
+pub fn early_depth() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_FOR_TESTS.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+/// What a pixel program gets of its console code's early depth test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EarlyDepth {
+    /// The console tests after the program (or it is no pixel program).
+    NotAsked,
+    /// D3D12's early test ([`early_depth`] on).
+    Given,
+    /// The late test: [`early_depth`] is off.
+    Off,
+    /// The late test: the program writes depth or stencil, which the early
+    /// test would not take.
+    Exports,
+}
+
+/// [`EarlyDepth`] of a pixel program with `db_shader_control` and these
+/// outputs, with [`early_depth`] `on`. Pure, for testing.
+pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigElement], on: bool) -> EarlyDepth {
+    if db_shader_control & DEPTH_BEFORE_SHADER == 0 {
+        EarlyDepth::NotAsked
+    } else if db_shader_control & DEPTH_STENCIL_EXPORT != 0
+        // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_StencilRef.
+        || outputs.iter().any(|o| (17..=20).contains(&o.kind))
+    {
+        EarlyDepth::Exports
+    } else if on {
+        EarlyDepth::Given
+    } else {
+        EarlyDepth::Off
+    }
+}
+
+static EARLY_DEPTH_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Pixel programs translated since the start whose console code tests depth
+/// before them ([`early_depth`]): given D3D12's early test, left with the
+/// late one because the switch is off, left with it because they write
+/// depth or stencil. (Translations served from the shader cache are not
+/// counted: a first run with the switch on translates every program anew.)
+pub fn early_depth_counts() -> [u64; 3] {
+    EARLY_DEPTH_COUNTS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -352,8 +436,29 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// LOCAL (per-slot copy-back, after DexNom/VIctory bc3cd4b's
+    /// `written_root_uavs`): those of `root_uavs` the code is proven never to
+    /// write through (only loads and size queries use the view, and nothing
+    /// is stored by address). Empty, the safe default, when unknown: every
+    /// root UAV then counts as written.
+    pub read_only_root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// LOCAL (upstream-port, 77e13a9, fxceless/victory-fork PR 927): table
+    /// descriptors (root parameter, dword offset in the table) whose buffer
+    /// the shader moves sixteen bits a channel as unsigned integers
+    /// (`buffer_load_format_d16_*` and `buffer_store_format_d16_*`, or a
+    /// format load whose results are read only as halves). On the console
+    /// each channel's 16 bits move as they are through a 16-bit float view
+    /// and through a 16-bit integer one alike. The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout. Empty unless
+    /// `VICTORY_HALF_VIEWS` is on (see `emit::half_views_mode`).
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path.
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -392,7 +497,169 @@ pub struct UserData {
 /// with that on for every program, 8,551 pixel programs of the title that
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
+///
+/// Per-hash switches ([`by_hash`]) are not applied: [`translate_hashed`]
+/// applies them.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    let _hash = Restore(&SHADER_HASH, SHADER_HASH.replace(None));
+    translate_any(container)
+}
+
+/// LOCAL: [`translate`] of the container whose hash (the first 16 hex digits
+/// of its BLAKE3, as the logs name shaders) is `hash`, with the switches
+/// that name shaders by hash applied ([`by_hash`]). The caller computes the
+/// hash: this crate does not.
+pub fn translate_hashed(container: &[u8], hash: &str) -> Result<HostShader, ShaderError> {
+    let _hash = Restore(&SHADER_HASH, SHADER_HASH.replace(parse_hash(hash)));
+    translate_any(container)
+}
+
+thread_local! {
+    /// LOCAL: the hash of the container being translated on this thread
+    /// ([`translate_hashed`]), lowercase.
+    static SHADER_HASH: std::cell::Cell<Option<[u8; 16]>> = const { std::cell::Cell::new(None) };
+}
+
+/// LOCAL: a shader hash as 16 lowercase hex digits (an optional `0x` before them).
+fn parse_hash(s: &str) -> Option<[u8; 16]> {
+    let s = s.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes: [u8; 16] = s.as_bytes().try_into().ok()?;
+    bytes.iter().all(u8::is_ascii_hexdigit).then(|| bytes.map(|b| b.to_ascii_lowercase()))
+}
+
+/// LOCAL: the shader hashes a switch lists (commas, semicolons or spaces
+/// between them); entries that are not 16 hex digits are left out. Pure, for
+/// testing.
+fn parse_hashes(value: Option<&str>) -> Vec<[u8; 16]> {
+    value
+        .map(|v| v.split([',', ';', ' ']).filter_map(parse_hash).collect())
+        .unwrap_or_default()
+}
+
+/// LOCAL (test switch): `VICTORY_SANITIZE_HASHES=<hex16>,...`: the listed
+/// shaders' stores through views (typed and raw) and, for pixel shaders,
+/// render-target writes have NaN and infinities replaced by 0
+/// (`shader::Shader::sanitize`). For finding whether white specks come from
+/// a numeric blow-up in a shader (the volumetric ones 5dc3b25986622949,
+/// 6f225b641c5b0708, 926c46bab3b86bd6, say). Off (empty) by default.
+fn sanitize_hashes() -> &'static [[u8; 16]] {
+    static LIST: std::sync::OnceLock<Vec<[u8; 16]>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let list = parse_hashes(std::env::var("VICTORY_SANITIZE_HASHES").ok().as_deref());
+        if !list.is_empty() {
+            eprintln!("VICTORY_SANITIZE_HASHES: NaN and infinities stored by {} shader(s) become 0", list.len());
+        }
+        list
+    })
+}
+
+/// LOCAL (port of DexNom/VIctory 5f4c3df): `VICTORY_PACKED_MASK_OFF=<hex16>,...`:
+/// the listed shaders do not keep scalar bitwise operations on a join of
+/// masks and numbers numeric (`lower::Options::packed_masks`);
+/// `VICTORY_PACKED_MASK=0` turns that off for every shader.
+fn packed_mask_off_hashes() -> &'static [[u8; 16]] {
+    static LIST: std::sync::OnceLock<Vec<[u8; 16]>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| parse_hashes(std::env::var("VICTORY_PACKED_MASK_OFF").ok().as_deref()))
+}
+
+/// LOCAL: whether the shader with `hash` (16 hex digits) translates
+/// differently by a switch that names shaders by hash
+/// (`VICTORY_SANITIZE_HASHES`, `VICTORY_PACKED_MASK_OFF`). A shader cache must
+/// neither serve nor keep such a translation: these switches are not part of
+/// the cache key, so that listing a shader does not translate every other
+/// one again.
+pub fn by_hash(hash: &str) -> bool {
+    if !any_by_hash() {
+        return false;
+    }
+    parse_hash(hash).is_some_and(|h| sanitize_hashes().contains(&h) || packed_mask_off_hashes().contains(&h))
+}
+
+/// LOCAL: whether any switch names shaders by hash ([`by_hash`]): when none
+/// does, a caller need not hash containers at all.
+pub fn any_by_hash() -> bool {
+    !sanitize_hashes().is_empty() || !packed_mask_off_hashes().is_empty()
+}
+
+/// LOCAL (port of DexNom/VIctory b8ff22e): `VICTORY_UINT_SRVS=0` declares
+/// the integer views of [`tiled_lighting_uint_srvs`] as floats again, as
+/// before. Part of the translation: the shader cache keys on it.
+fn uint_srvs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UINT_SRVS").is_none_or(|v| v != "0"))
+}
+
+/// LOCAL (upstream-port 77e13a9, fxceless/victory-fork PR 927): no table view
+/// moves halves as unsigned integers (`VICTORY_HALF_VIEWS=0`).
+pub(crate) const HALVES_OFF: u8 = 0;
+/// LOCAL (upstream-port 77e13a9): the default: a table view moves halves as
+/// unsigned integers where a format load read only as halves reaches it (a
+/// case our d16 path, `Lower::integer_view`, does not cover); d16-only views
+/// keep our own path (`VICTORY_HALF_VIEWS=1`).
+pub(crate) const HALVES_READS: u8 = 1;
+/// LOCAL (upstream-port 77e13a9): upstream's rule, d16-only views too
+/// (`VICTORY_HALF_VIEWS=all`).
+pub(crate) const HALVES_ALL: u8 = 2;
+
+/// LOCAL (upstream-port 77e13a9): `VICTORY_HALF_VIEWS` ([`HALVES_READS`] for
+/// `1`, [`HALVES_ALL`] for `all`, else [`HALVES_OFF`], the default (port-fix)). Part of the translation:
+/// the shader cache keys on it.
+fn half_views_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_HALF_VIEWS").as_deref() {
+        // LOCAL (port-fix): off unless asked for (`1`, or `all`): the reviews
+        // found the views it shows not yet safe for every draw.
+        Ok("1") => HALVES_READS,
+        Ok("all") => HALVES_ALL,
+        _ => HALVES_OFF,
+    })
+}
+
+/// LOCAL (port of DexNom/VIctory 5f4c3df): `VICTORY_PACKED_MASK=0` turns off
+/// [`lower::Options::packed_masks`] for every shader. Part of the
+/// translation: the shader cache keys on it.
+fn packed_masks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PACKED_MASK").is_none_or(|v| v != "0"))
+}
+
+/// LOCAL (port of DexNom/VIctory b8ff22e): the tiled-lighting vertex program
+/// and six eye-lighting pixel programs read scalar UINT masks and indices
+/// from typed views. These stripped programs have no bitcode or reflected
+/// component types, so the views are named by the container's digest and the
+/// exact root-table field: (root slot, table offset in dwords, DXIL resource
+/// kind: 2 Texture2D, 4 Texture3D, 10 TypedBuffer). Other fields of these
+/// very programs hold float textures.
+fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
+    const DIRECTIONAL_EYE: &[(u8, u32, u32)] = &[(0, 32, 10), (0, 968, 2), (0, 1160, 2), (1, 72, 2), (1, 80, 4)];
+    match u128::from_be_bytes(digest) {
+        0x8386ec5b_47a3b2de_49309239_7987b35d => &[(1, 48, 2), (1, 56, 2)],
+        0x46545633_f601b707_19765403_267442c5
+        | 0xa3c6e3b5_a1226f1b_3b08afe2_ac7b6c3d
+        | 0x58795ccc_1d3237cf_683a8a7a_a88391fd => DIRECTIONAL_EYE,
+        0x56d5f614_619f530c_f1cf2b90_43b580e8
+        | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
+        | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
+        _ => &[],
+    }
+}
+
+/// LOCAL: what the program of container `c` is told beside its parts
+/// ([`lower::Options`]).
+fn options(c: &Container) -> lower::Options {
+    let hash = SHADER_HASH.get();
+    let listed = |list: &[[u8; 16]]| hash.is_some_and(|h| list.contains(&h));
+    lower::Options {
+        uint_srvs: if uint_srvs_on() { tiled_lighting_uint_srvs(c.digest) } else { &[] },
+        sanitize: listed(sanitize_hashes()),
+        // ([`emit`]'s last try; it checks `VICTORY_PACKED_MASK` and the hash list)
+        packed_masks: PACKED_TRY.get(),
+        half_views: half_views_mode(),
+    }
+}
+
+fn translate_any(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -430,6 +697,11 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// LOCAL (port of DexNom/VIctory 5f4c3df): a compute program that does not
+/// translate is tried once more with scalar bitwise words packed from a join
+/// of masks and numbers kept numeric (`lower::Options::packed_masks`). Only
+/// then: a program that translates without it is what it was.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -438,6 +710,105 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let r = emit_once(c, native, p, st, io, res);
+    if !matches!(r, Err(ShaderError::Unsupported { .. })) || native.stage != HwStage::Cs || PACKED_TRY.get() {
+        return r;
+    }
+    let hash = SHADER_HASH.get();
+    if !packed_masks_on() || hash.is_some_and(|h| packed_mask_off_hashes().contains(&h)) {
+        return r;
+    }
+    let _again = Restore(&PACKED_TRY, PACKED_TRY.replace(true));
+    let again = emit_once(c, native, p, st, io, res);
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        match &again {
+            Ok(_) => eprintln!("PACKED-MASK retry: translated"),
+            Err(e) => eprintln!("PACKED-MASK retry: {e}"),
+        }
+    }
+    again.or(r)
+}
+
+thread_local! {
+    /// LOCAL: [`emit`]'s last try is on (`lower::Options::packed_masks`).
+    static PACKED_TRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// LOCAL: puts a thread-local cell back as it was when dropped, a panic included.
+struct Restore<T: Copy + 'static>(&'static std::thread::LocalKey<std::cell::Cell<T>>, T);
+
+impl<T: Copy + 'static> Drop for Restore<T> {
+    fn drop(&mut self) {
+        self.0.set(self.1);
+    }
+}
+
+fn emit_once(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let r = emit_forms(c, native, p, st, io, res);
+    // LOCAL (port of Neptune_VI's paired form): a console wave64 compute program on a host of
+    // 32-lane waves that no form above gives the host (it still asks for 64-lane waves, which
+    // the host refuses, or does not translate): once more in the paired form, each console
+    // wave run by one host wave (`paired`; `VICTORY_WAVE_PAIRS=0` turns it off).
+    let refused = match &r {
+        Ok((_, wave)) => *wave == Some(64),
+        Err(e) => matches!(e, ShaderError::Unsupported { .. }),
+    };
+    if refused
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && pairs_on()
+    {
+        let again = paired(c, native, p, io, res);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired lanes: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
+            }
+        }
+        if let Ok((shader, _)) = again {
+            return Ok(shader);
+        }
+    }
+    r.map(|(shader, _)| shader)
+}
+
+/// LOCAL (paired form): whether console wave64 compute programs may take the paired form
+/// ([`paired`]): `VICTORY_WAVE_PAIRS=0` turns it off (a test can choose for its own thread).
+/// Part of the translation: the shader cache keys on the switch's value
+/// ([`translation_fingerprint`]).
+fn pairs_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PAIRS.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`pairs_on`], for its thread only.
+    static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`emit`] in every form but the paired one, with the wave size the result requires of the
+/// host; LOCAL: where an approximate form translates the program, the paired form instead if
+/// it does.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -502,7 +873,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
@@ -512,6 +883,24 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // LOCAL (port of Neptune_VI's paired form): where an approximate form below translates
+        // the program, the paired form ([`paired`]) is tried first: it runs each console wave
+        // as one host wave and gives what the console's 64 lanes compute, at no barrier but
+        // the entry's; the approximate form is kept for a program the paired form does not
+        // take. (Neptune_VI measured 36 of 39 such programs of the title take it there; the
+        // other three were the allocation idiom, exact per half.) Only these change: a program
+        // an approximate form does not take goes on as before, and the paired form stays last
+        // for it ([`emit`]). (`VICTORY_WAVE_PAIRS=0` turns the paired form off here too.)
+        let exactly = |approximate: Result<(HostShader, Option<u32>), ShaderError>| {
+            if pairs_on() {
+                let again = paired(c, native, p, io, res);
+                report("paired lanes, before an approximate form", &again);
+                if again.is_ok() {
+                    return again;
+                }
+            }
+            approximate
+        };
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -527,7 +916,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -544,7 +933,7 @@ pub fn emit(
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            return again;
                         }
                     }
                 }
@@ -562,7 +951,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return if exact { local } else { exactly(local) };
                     }
                 }
             }
@@ -570,7 +959,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return if exact { local } else { exactly(local) };
                 }
             }
         }
@@ -582,14 +971,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return exactly(local);
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return exactly(local);
                 }
             }
         }
@@ -611,7 +1000,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -625,7 +1013,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -689,6 +1077,57 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// LOCAL (port of Neptune_VI's paired form): `p` (a console wave64 compute program on a host
+/// of 32-lane waves) in the paired form ([`lower::with_paired_lanes`]): each console wave run
+/// by one host wave of 32 lanes, each thread two of its lanes, with every per-lane branch
+/// taken by the whole wave as the console takes it ([`structure::structure_wide`]), so that a
+/// host wave's threads go the same way and EXEC stays each lane's guard. The program's
+/// barriers are reached by whole host waves where the console's waves reach them; the only
+/// barriers added are on entry, before the program, where a group of several console waves
+/// numbers its waves (`Lower::wave_base`). A thread group whose console waves are not full
+/// would need the lanes past its end kept out of every effect: refused.
+/// Descriptors and addresses stay those traced on the lanes' own paths (`res`, as for every
+/// other form): the per-lane form rests on a lane that reads a scalar after a join having
+/// come the way the wave did, and knowing less of a lane's way the wave-wide form would miss
+/// some of them (a sampler set in a skip that only a wave with no lane left for it skips).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    if cs.threads.iter().product::<u32>() % 64 != 0 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -763,7 +1202,14 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    // (as `lower` decides it, counted for a program that translates)
+    let early = match &native.io {
+        crate::native::StageIo::Ps { db_shader_control, .. } => {
+            early_depth_of(*db_shader_control, &outputs, early_depth())
+        }
+        _ => EarlyDepth::NotAsked,
+    };
+    let l = lower::lower_told(&lower::Parts {
         native,
         p,
         st,
@@ -773,7 +1219,16 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    }, options(c))?;
+    let counted = match early {
+        EarlyDepth::NotAsked => None,
+        EarlyDepth::Given => Some(0),
+        EarlyDepth::Off => Some(1),
+        EarlyDepth::Exports => Some(2),
+    };
+    if let Some(n) = counted {
+        EARLY_DEPTH_COUNTS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -795,7 +1250,9 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        read_only_root_uavs: l.read_only_root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -958,6 +1415,30 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// LOCAL: the shader hashes `VICTORY_SANITIZE_HASHES` and `VICTORY_PACKED_MASK_OFF`
+    /// list, in any case and with any separator; what is not 16 hex digits is left out.
+    #[test]
+    fn hash_lists_take_sixteen_hex_digits() {
+        let list = super::parse_hashes(Some("5DC3B25986622949, 6f225b641c5b0708;0x926c46bab3b86bd6 bad 12345"));
+        assert_eq!(
+            list,
+            [*b"5dc3b25986622949", *b"6f225b641c5b0708", *b"926c46bab3b86bd6"]
+        );
+        assert!(super::parse_hashes(None).is_empty());
+        assert!(super::parse_hashes(Some("")).is_empty());
+        assert_eq!(super::parse_hash("zzc3b25986622949"), None);
+    }
+
+    /// LOCAL (DexNom/VIctory b8ff22e): only the seven named containers have integer views.
+    #[test]
+    fn integer_views_are_named_by_digest() {
+        let vs = 0x8386ec5b_47a3b2de_49309239_7987b35du128.to_be_bytes();
+        assert_eq!(super::tiled_lighting_uint_srvs(vs), [(1, 48, 2), (1, 56, 2)]);
+        let eye = 0x56d5f614_619f530c_f1cf2b90_43b580e8u128.to_be_bytes();
+        assert_eq!(super::tiled_lighting_uint_srvs(eye).len(), 4);
+        assert!(super::tiled_lighting_uint_srvs([0; 16]).is_empty());
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
@@ -1168,6 +1649,123 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// Which pixel programs keep the console's early depth test: those whose
+    /// `DB_SHADER_CONTROL` asks for it and that write neither depth nor
+    /// stencil, with the switch on.
+    #[test]
+    fn early_depth_is_given_where_the_console_tests_before_the_program() {
+        let el = |kind| SigElement {
+            name: "X".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let target = [el(16)];
+        // The title's transparent pass: early Z then late Z, kill, run for
+        // no-op colour writes, depth before the program.
+        let glass = 0x1450;
+        assert_eq!(early_depth_of(glass, &target, true), EarlyDepth::Given);
+        assert_eq!(early_depth_of(glass, &target, false), EarlyDepth::Off);
+        // Early Z then late Z alone is the hardware's choice, not the title's.
+        assert_eq!(early_depth_of(0x50, &target, true), EarlyDepth::NotAsked);
+        assert_eq!(early_depth_of(0, &target, true), EarlyDepth::NotAsked);
+        // A depth or stencil export keeps the late test.
+        assert_eq!(early_depth_of(glass | 1, &target, true), EarlyDepth::Exports);
+        assert_eq!(early_depth_of(glass | 4, &target, true), EarlyDepth::Exports);
+        for kind in 17..=20 {
+            assert_eq!(early_depth_of(glass, &[el(16), el(kind)], true), EarlyDepth::Exports);
+        }
+    }
+
+    /// A pixel program whose console code tests depth before it declares
+    /// D3D12's early depth-stencil test (ShaderFlags bit 3) with
+    /// `VICTORY_EARLY_DEPTH` on, and not with it off nor where the console
+    /// tests after it; dxil.dll, where there is one, takes the declaration.
+    #[test]
+    fn the_consoles_early_depth_test_is_declared_with_the_switch() {
+        let translate = |db_shader_control: u32, on: bool| {
+            EARLY_DEPTH_FOR_TESTS.with(|c| c.set(Some(on)));
+            let words = [
+                0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                0xF800_180F,
+                0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let target = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let outputs = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            let lowered = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs,
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            let before = early_depth_counts();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let after = early_depth_counts();
+            EARLY_DEPTH_FOR_TESTS.with(|c| c.set(None));
+            (lowered.early_depth, out.dxil, before, after)
+        };
+        let (given, dxil, before, after) = translate(0x1450, true);
+        assert!(given, "asked for and switched on: declared");
+        assert!(after[0] > before[0], "counted as given");
+        let (off, _, before, after) = translate(0x1450, false);
+        assert!(!off, "switched off: the late test, as before");
+        assert!(after[1] > before[1], "counted as left late");
+        let (late, _, _, _) = translate(0, true);
+        assert!(!late, "the console tests after the program: the late test");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.clone()).unwrap();
+        }
+        let _ = dxil;
     }
 
     /// A pixel program with an ordered section, as the console compiler
@@ -1577,7 +2175,9 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            read_only_root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1589,7 +2189,9 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                read_only_root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2198,7 +2800,9 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            read_only_root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2351,7 +2955,9 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                read_only_root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2767,7 +3373,9 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            read_only_root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.

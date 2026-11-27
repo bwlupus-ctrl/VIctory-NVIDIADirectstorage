@@ -149,8 +149,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    // LOCAL: the read map counts this file's reads by request (`read_into`),
+    // not by the handle `CreateFileW` noted: the file object closes it.
+    let map = if super::read_map::on() { super::read_map::take_handle(handle) } else { None };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, map });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -269,6 +272,9 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// LOCAL: this file's counters in the read map (`VICTORY_READ_MAP`),
+    /// if one is recorded and the file is one of the package's.
+    map: Option<&'static super::read_map::FileCounts>,
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -808,6 +814,21 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let secs = elapsed.as_secs_f64();
+            let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64;
+            tracing::info!(
+                zlib_workers = format_args!("{:.2}", take(&INFLATING) / 1e9 / secs),
+                zlib_in_mb_s = format_args!("{:.1}", take(&INFLATED_IN) / 1e6 / secs),
+                zlib_out_mb_s = format_args!("{:.1}", take(&INFLATED_OUT) / 1e6 / secs),
+                bcpack_decode_workers = format_args!("{:.2}", take(&UNPACKING) / 1e9 / secs),
+                bcpack_in_mb_s = format_args!("{:.1}", take(&UNPACKED_IN) / 1e6 / secs),
+                bcpack_out_mb_s = format_args!("{:.1}", take(&UNPACKED_OUT) / 1e6 / secs),
+                reading_workers = format_args!("{:.2}", reading / secs),
+                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / secs),
+                requests = *requests,
+                waiting = self.lanes.values().map(|l| l.reads.len()).sum::<usize>(),
+                "dstorage decode: last {secs:.1} s"
+            );
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -1409,9 +1430,14 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+        Some(tables) => {
+            let started = std::time::Instant::now();
+            let decoded = bcpack::decode(bc, &source, out, tables);
+            UNPACKING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            UNPACKED_IN.fetch_add(source.len() as u64, Ordering::Relaxed);
+            UNPACKED_OUT.fetch_add(out.len() as u64, Ordering::Relaxed);
+            decoded.map(|()| out.len()).map_err(|e| fail(INVALID_DATA, &e.to_string()))
+        }
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
@@ -1427,6 +1453,15 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+    let started = std::time::Instant::now();
+    let result = inflate_timed(source, out);
+    INFLATING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    INFLATED_IN.fetch_add(source.len() as u64, Ordering::Relaxed);
+    INFLATED_OUT.fetch_add(*result.as_ref().unwrap_or(&0) as u64, Ordering::Relaxed);
+    result
+}
+
+fn inflate_timed(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
     thread_local! {
         static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
             std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
@@ -1526,6 +1561,14 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds workers spent inflating zlib, and its bytes in and out.
+static INFLATING: AtomicU64 = AtomicU64::new(0);
+static INFLATED_IN: AtomicU64 = AtomicU64::new(0);
+static INFLATED_OUT: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds workers spent decoding BCPack, and its bytes in and out.
+static UNPACKING: AtomicU64 = AtomicU64::new(0);
+static UNPACKED_IN: AtomicU64 = AtomicU64::new(0);
+static UNPACKED_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// How often a read the host refuses is tried again (about 0.25 s in all).
 const READ_RETRIES: u32 = 8;
@@ -1538,9 +1581,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .files;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let files = &file.files;
+    // LOCAL: the read map: the bytes of the file this request reads.
+    if let Some(map) = file.map {
+        map.record(request.offset, out.len() as u64);
+    }
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {
@@ -1596,8 +1642,38 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out).map(drop);
+        // LOCAL (wc-vram): a destination in card memory (`VICTORY_WC_VRAM`) is not decoded in
+        // place (zlib's back-references would read it across the bus): decoded into memory of
+        // this thread's, then written in (write-only). Off: one relaxed load.
+        let filled = if victory_gpu::wc_vram::touches(request.destination as usize, len) {
+            thread_local! {
+                static ASIDE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            ASIDE.with_borrow_mut(|aside| {
+                if aside.len() < len {
+                    aside.resize(len, 0);
+                }
+                let n = fill(&mut aside[..len])?;
+                // SAFETY: the destination holds `len` bytes, `n` of them produced.
+                unsafe { victory_gpu::wc_vram::write_stream(out.as_mut_ptr(), &aside[..n.min(len)]) };
+                Ok(())
+            })
+        } else {
+            // LOCAL (gpu-first): decoded straight into title memory, whose back-references read it:
+            // counted when it is write-combined (`victory_gpu::memclass`; off unless asked for).
+            victory_gpu::memclass::wc_read(request.destination as usize, len);
+            fill(out).map(drop)
+        };
         drop(writing);
+        // LOCAL (gpu-first): streaming by class (`VICTORY_CLASS_STATS`; off: no-op).
+        if filled.is_ok() {
+            victory_gpu::memclass::streamed(request.destination as usize, len);
+        }
+        // LOCAL (heap-probe): DirectStorage's bytes in the range followed (`VICTORY_HEAP_PROBE=1`).
+        victory_gpu::heapprobe::dstorage(request.destination as usize, len);
+        // LOCAL (journal): what was written, for the GPU side (`VICTORY_STREAM_JOURNAL=1`;
+        // off: no-op). Before the completion is told; a failed fill may have written some.
+        victory_gpu::stream_journal::wrote_raw(request.destination as usize, len);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
         if super::xmem::stream_notice() {
@@ -1951,6 +2027,29 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, plain);
+    }
+
+    // LOCAL (wc-vram): a destination in card memory (`VICTORY_WC_VRAM`) is inflated aside and
+    // written in, and holds what the stream says. Skipped without a card with a BAR.
+    #[test]
+    fn a_destination_in_card_memory_is_inflated_aside() {
+        let Ok(block) = victory_gpu::wc_vram::allocate(64 << 20, 1 << 32, (1 << 40) - 1) else {
+            eprintln!("no card memory mapped through a BAR here; skipped");
+            return;
+        };
+        let plain = pattern(700_000);
+        let packed = compress_zlib(&plain);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let at = block + 0x1234;
+        let r = request(ZLIB | MEMORY_SOURCE, at as *mut c_void, plain.len(), packed.as_ptr().cast(), 0, packed.len());
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let mut out = vec![0u8; plain.len()];
+        assert!(victory_gpu::wc_vram::copy_out(at, &mut out));
+        assert_eq!(out, plain);
+        assert!(victory_gpu::wc_vram::release(block));
     }
 
     #[test]

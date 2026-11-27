@@ -238,6 +238,8 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    // LOCAL: the read map is written once more on the way out.
+    super::read_map::flush();
     host::exit(code)
 }
 
@@ -286,6 +288,8 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        // LOCAL: the read map is written once more on the way out.
+        super::read_map::flush();
     }
     host::terminate_process(process, code)
 }

@@ -572,6 +572,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
+    // LOCAL (wc-vram): the title's write-combined stores into card memory (`crate::wc_vram`) are
+    // out of this core's buffers before its lists go (a store fence; harmless off).
+    #[cfg(windows)]
+    crate::wc_vram::fence_stores();
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -794,6 +798,10 @@ impl Written {
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);
+        // LOCAL (wc-vram): what went into card memory through the BAR before it (the landing's
+        // writes) is there before the value is (`crate::wc_vram`; a store fence, harmless off).
+        #[cfg(windows)]
+        crate::wc_vram::fence_stores();
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -802,6 +810,8 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        #[cfg(windows)]
+        crate::wc_vram::fence_stores();
     }
 }
 
@@ -914,6 +924,17 @@ extern "system" fn present(
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // `VICTORY_EARLY_DEPTH`: what became of the console's early depth
+            // test in the pixel programs translated so far.
+            let [given, off, exports] = victory_shader::emit::early_depth_counts();
+            if given + off + exports > 0 {
+                tracing::info!(
+                    given,
+                    off,
+                    exports,
+                    "pixel programs translated so far whose console code tests depth before them: given the host's early test (VICTORY_EARLY_DEPTH=1), left with the late test (switch off), left with it as they write depth or stencil"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1188,12 +1209,22 @@ extern "system" fn copy_page_mappings(
     let mut ok = true;
     let many = crate::resource::many_page_mapper();
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
-    let mut map = |to: u64, from: u64, len: u64| match many {
-        Some(_) => {
-            gathered.push((to, from, len));
-            true
+    // LOCAL (heap-probe): bytes of the range followed that this call maps from or to
+    // (`VICTORY_HEAP_PROBE=1`; off: nothing).
+    let mut probed = 0usize;
+    let probing = crate::heapprobe::on();
+    let mut map = |to: u64, from: u64, len: u64| {
+        if probing {
+            probed += crate::heapprobe::overlap(to as usize, len as usize)
+                + if from != 0 { crate::heapprobe::overlap(from as usize, len as usize) } else { 0 };
         }
-        None => map(to, from, len),
+        match many {
+            Some(_) => {
+                gathered.push((to, from, len));
+                true
+            }
+            None => map(to, from, len),
+        }
     };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1216,6 +1247,8 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
+    // LOCAL (heap-probe): one call that touched the range followed.
+    crate::heapprobe::note_bytes(crate::heapprobe::Call::CopyMap, probed);
     if let Some(many) = many {
         ok &= many(&gathered);
     }

@@ -570,6 +570,15 @@ struct SopMasks {
 
 const MAX_ROUNDS: usize = 256;
 
+/// LOCAL (port of DexNom/VIctory 76749ce): whether a wave64 mask restored
+/// from two `s_mov_b32` copies of its dwords is taken as the mask it was
+/// copied from ([`Lanes::mask`]). On unless `VICTORY_WAVE64_MASK_COPIES=0`.
+/// Part of the translation: the shader cache keys on the switch.
+fn mask_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE64_MASK_COPIES").is_none_or(|v| v != "0"))
+}
+
 impl<'a> Lanes<'a> {
     fn new(p: &'a Program) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
@@ -908,6 +917,34 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // LOCAL (port of DexNom/VIctory 76749ce): a wave64 mask parked in
+        // two scalar registers and restored one dword at a time (two
+        // `s_mov_b32` chains, which the spill pass leaves behind) is still
+        // the mask it was copied from, but only when both dwords come from
+        // the same known pair in their own order (low from low, high from
+        // high). The lane's bit is then the same function of the lane in
+        // every form: the paired form (host lane n runs console lanes n and
+        // n + 32) evaluates it once per console lane, so lanes 32-63 take
+        // the high dword's bits as the source pair's did.
+        // `VICTORY_WAVE64_MASK_COPIES=0` turns it off.
+        // The copies take the source pair's mask and its kind: `masks` holds
+        // the ones derived from EXEC or a VALU result, `other` the rest, and
+        // the pair goes in the same cache, as the end of this function puts
+        // what it computes. A source pair not seen yet (copied before its mask
+        // was asked for) falls through to the opaque atom below, as before.
+        if self.p.wave64 && mask_copies() {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k {
+                if let Some(&m) = self.masks.get(&source) {
+                    self.masks.insert(k, m);
+                    return (m, true);
+                }
+                if let Some(&m) = self.other.get(&source) {
+                    self.other.insert(k, m);
+                    return (m, false);
+                }
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -948,6 +985,27 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// LOCAL (DexNom/VIctory 76749ce): the value `value` was copied from
+    /// through a chain of plain `s_mov_b32` from one SGPR (`value` itself
+    /// when it is not such a copy).
+    fn move_source(&self, mut value: Value) -> Value {
+        // (a chain is never longer than the program; a bound all the same)
+        for _ in 0..64 {
+            let Some(&(b, i)) = self.defs.get(&value) else {
+                break;
+            };
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1730,6 +1788,75 @@ mod tests {
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
         }
+    }
+
+    /// (DexNom/VIctory 76749ce) A wave64 compare result saved whole on one path and as two
+    /// dwords copied through two SGPRs each on the other is the compare at the join while
+    /// the high dword is the compare's high dword; not when it is the low dword again.
+    #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
+    }
+
+    /// LOCAL: the same copies on one path only: the pair of copies is the compare, for the
+    /// exact pair the paired form checks masks by too; a pair whose dwords are swapped is not.
+    #[test]
+    fn split_scalar_copies_of_a_wave64_mask_are_the_mask_in_their_order_only() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBE83_036B, // s_mov_b32 s3, vcc_hi
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let low = p.blocks[0].insts[3].write(Reg::S(4)).unwrap();
+        let high = p.blocks[0].insts[4].write(Reg::S(5)).unwrap();
+        assert_eq!(s.masks[&low], s.masks[&compare]);
+        assert_eq!(s.mask_bits(low, Some(high)), Some(s.masks[&compare]));
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE84_036B, // s_mov_b32 s4, vcc_hi
+                0xBE85_036A, // s_mov_b32 s5, vcc_lo
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let low = p.blocks[0].insts[1].write(Reg::S(4)).unwrap();
+        assert_ne!(s.masks.get(&low), Some(&s.masks[&compare]));
     }
 
     #[test]

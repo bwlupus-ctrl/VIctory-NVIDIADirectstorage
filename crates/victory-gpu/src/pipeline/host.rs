@@ -524,6 +524,8 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_FAULTS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            // LOCAL (port of cool_fox f4b48ad): ours too.
+                            || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
@@ -598,6 +600,10 @@ impl HostPipeline {
                 return None;
             }
         };
+        // LOCAL (scarlett-port, `VICTORY_SAMPLERS_MADE`): whether it has static
+        // samplers; held until every pipeline made below (compute, graphics,
+        // mesh, depth bounds) has been made (`library::with_static_samplers`).
+        let _samplers = super::library::with_static_samplers(!samplers.is_empty());
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),

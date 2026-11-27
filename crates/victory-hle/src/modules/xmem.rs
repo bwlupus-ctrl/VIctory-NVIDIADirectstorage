@@ -137,9 +137,29 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // LOCAL (wc-vram): `VICTORY_WC_VRAM=1` (off by default): the selection `VICTORY_HONOUR_WC`
+    // makes (of at least `VICTORY_WC_VRAM_MIN_MB`, 64) is made in the card's memory, mapped for
+    // the CPU through the resizable BAR (`victory_gpu::wc_vram`); refused, as before.
+    if constrained
+        && !placeholder
+        && victory_gpu::wc_vram::on()
+        && let Some(at) = wc_vram_alloc(asked, protect, kind, flags, size, lowest, highest)
+    {
+        return at;
+    }
+    // LOCAL (wc-vram): a commit (or reset) inside such a block: committed already, and a part the
+    // title decommitted was zeroed then (the mapping refuses both calls). Off: one relaxed load.
+    if !constrained && victory_gpu::wc_vram::holds(base as usize, size.max(1)) {
+        victory_gpu::wc_vram::commit_inside();
+        return base;
+    }
+    // LOCAL (gpu-first): `VICTORY_HONOUR_WC=1` (off by default) keeps the title's write-combining
+    // (or uncached) on the host for its private committed GPU memory, as the console has it
+    // (`honoured_protection`); else both are dropped, as before.
+    let honoured = honoured_protection(asked, protect, kind, base.is_null() && !placeholder, size);
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let allocate = |protect: u32, parameter: &mut MEM_EXTENDED_PARAMETER| unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -147,13 +167,39 @@ pub extern "system" fn XMemVirtualAlloc(
             kind,
             protect,
             if constrained {
-                &mut parameter
+                parameter
             } else {
                 std::ptr::null_mut()
             },
             constrained.into(),
         )
     };
+    let mut host_wc = honoured.is_some();
+    let mut at = allocate(honoured.unwrap_or(protect), &mut parameter);
+    if let Some(with) = honoured {
+        // LOCAL (gpu-first): refused, or the write watch does not work on it: as before.
+        let refused = if at.is_null() {
+            Some(std::io::Error::last_os_error())
+        } else {
+            write_watch_refused(at, size, kind)
+        };
+        if let Some(error) = refused {
+            tracing::warn!(
+                "VICTORY_HONOUR_WC: host protection {with:#x} for title memory {size:#x} (kind {kind:#x}, asked {asked:#x}) failed ({error}); allocated without it"
+            );
+            if !at.is_null() {
+                // SAFETY: the allocation just made, not handed out.
+                unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+            }
+            host_wc = false;
+            at = allocate(protect, &mut parameter);
+        } else {
+            tracing::info!(
+                "VICTORY_HONOUR_WC: title memory {at:p}+{size:#x} ({} MB, asked {asked:#x}, kind {kind:#x}) is write-combined on the host (protection {with:#x})",
+                size >> 20
+            );
+        }
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -181,7 +227,176 @@ pub extern "system" fn XMemVirtualAlloc(
         victory_gpu::title_memory_allocated(at as usize, size);
     }
     note_protection(asked, kind, flags, at as usize, size);
+    // LOCAL (gpu-first): the class registry (`VICTORY_CLASS_STATS`/`VICTORY_HONOUR_WC`; off: no-op).
+    if !at.is_null() {
+        victory_gpu::memclass::allocated(at as usize, size, asked, kind, flags, placeholder, host_wc);
+    }
     at
+}
+
+/// LOCAL (wc-vram): the title's write-combined GPU block in card memory (`victory_gpu::wc_vram`),
+/// if [`honour_policy`] selects it (with `VICTORY_WC_VRAM_MIN_MB`) and the card takes it; `None`:
+/// made as before (the reason is logged and counted there). `kind` as passed to the host.
+fn wc_vram_alloc(asked: u32, protect: u32, kind: u32, flags: u64, size: usize, lowest: usize, highest: usize) -> Option<*mut c_void> {
+    honour_policy(victory_gpu::wc_vram::min_bytes(), asked, protect, kind, true, size)?;
+    let at = victory_gpu::wc_vram::allocate(size, lowest, highest).ok()?;
+    victory_gpu::title_memory_allocated(at, size);
+    note_protection(asked, kind, flags, at, size);
+    // (No write watch on it: the registry is told the kind without.)
+    victory_gpu::memclass::allocated(at, size, asked, kind & !MEM_WRITE_WATCH, flags, false, true);
+    Some(at as *mut c_void)
+}
+
+/// LOCAL (wc-vram): the title's `VirtualFree` of memory in a block in card memory, which the
+/// host refuses (error 87): a release of the block parks it (`victory_gpu::wc_vram::release`), a
+/// decommit zeroes the pages (they read as zeros when committed again). `None`: the host's call
+/// (placeholder calls; they fail there).
+fn wc_vram_free(at: usize, size: usize, kind: u32) -> Option<BOOL> {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, SetLastError};
+    const MEM_DECOMMIT: u32 = 0x4000;
+    let failed = || {
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        0
+    };
+    if kind & MEM_RELEASE != 0 {
+        if size == 0 && victory_gpu::wc_vram::release(at) {
+            victory_gpu::memclass::released(at);
+            return Some(1);
+        }
+        return Some(failed());
+    }
+    if kind & MEM_DECOMMIT != 0 {
+        return Some(if victory_gpu::wc_vram::decommit(at, size) { 1 } else { failed() });
+    }
+    None
+}
+
+/// LOCAL (wc-vram): what a query of title memory in a block in card memory says, as for the
+/// allocation the title asked for: its base, the run to its end, committed read-write private
+/// memory (the mapping says its own base, the padding beside it, and write-combined).
+fn wc_vram_query(at: usize, info: &mut MEMORY_BASIC_INFORMATION) {
+    use windows_sys::Win32::System::Memory::MEM_PRIVATE;
+    if !victory_gpu::wc_vram::touches(at, 1) {
+        return;
+    }
+    let Some((title, len)) = victory_gpu::wc_vram::title_block(at) else {
+        return;
+    };
+    let page = at & !0xfff;
+    info.BaseAddress = page as *mut c_void;
+    info.AllocationBase = title as *mut c_void;
+    info.AllocationProtect = PAGE_READWRITE;
+    info.RegionSize = (title + len).next_multiple_of(0x1000) - page;
+    info.State = MEM_COMMIT;
+    info.Protect = PAGE_READWRITE;
+    info.Type = MEM_PRIVATE;
+    victory_gpu::wc_vram::query_answered();
+}
+
+/// LOCAL (wc-vram): the title's own `VirtualProtect` (hooked with `VICTORY_WC_VRAM=1` only):
+/// in a block in card memory, whose mapping refuses protection changes, passed over (said);
+/// elsewhere the host's.
+extern "system" fn title_virtual_protect(address: *const c_void, size: usize, new: u32, old: *mut u32) -> BOOL {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    // LOCAL (heap-probe): a page the probe made inaccessible is given back first, and none is
+    // armed until the call is over: the title sees (and later restores) the protection it
+    // gave (`VICTORY_HEAP_PROBE=1`; off: nothing).
+    let _probe = victory_gpu::heapprobe::emulator_reading(address as usize, size.max(1));
+    if victory_gpu::wc_vram::touches(address as usize, size.max(1)) {
+        victory_gpu::wc_vram::protect_passed_over(address as usize, size, new);
+        if !old.is_null() {
+            // SAFETY: the title's out pointer.
+            unsafe { old.write(PAGE_READWRITE) };
+        }
+        return 1;
+    }
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualProtect(address, size, new, old) }
+}
+
+/// LOCAL (wc-vram): the title's own `VirtualAlloc` (hooked with `VICTORY_WC_VRAM=1` only): a
+/// commit (or reset) inside a block in card memory, which the host refuses (error 87), is
+/// committed already (a decommitted part was zeroed then): the address, counted and said;
+/// everything else the host's.
+extern "system" fn title_virtual_alloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    const MEM_RESET: u32 = 0x8_0000;
+    if !address.is_null() && kind & (MEM_COMMIT | MEM_RESET) != 0 && victory_gpu::wc_vram::holds(address as usize, size.max(1)) {
+        use victory_gpu::wc_vram::{Count, count};
+        count(Count::TitleCommits, 1);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!("wc-vram: the title's VirtualAlloc {address:p}+{size:#x} (kind {kind:#x}, protection {protect:#x}) inside card memory: committed already");
+        }
+        victory_gpu::wc_vram::commit_inside();
+        return address;
+    }
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualAlloc(address, size, kind, protect) }
+}
+
+/// LOCAL (wc-vram): the title's own `VirtualQuery` (hooked with `VICTORY_WC_VRAM=1` only): the
+/// host's answer, but for title memory in a block in card memory ([`wc_vram_query`]).
+extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    // LOCAL (heap-probe): the page asked about is not one of the probe's for now (`VICTORY_HEAP_PROBE=1`).
+    let _probe = victory_gpu::heapprobe::emulator_reading(address as usize, 1);
+    // SAFETY: the title's own arguments.
+    let n = unsafe { VirtualQuery(address, out, len) };
+    if n >= size_of::<MEMORY_BASIC_INFORMATION>() && !out.is_null() {
+        // SAFETY: the host filled it in.
+        wc_vram_query(address as usize, unsafe { &mut *out });
+    }
+    n
+}
+
+/// LOCAL (gpu-first): with `VICTORY_HONOUR_WC=1`, the host protection that keeps the title's
+/// write-combining (console 0x400 -> `PAGE_WRITECOMBINE`) or uncached (0x200 -> `PAGE_NOCACHE`)
+/// for memory both processors reach (a GPU bit) that is committed here and now, private, at an
+/// address of ours (`fresh`: not a commit in a reservation, not one for physical pages; views
+/// and pool pages are never changed), of at least `VICTORY_HONOUR_WC_MIN_MB`. `None`: as
+/// before. A CPU read of such memory is slow (0.08 GB/s here, against 30 for plain memory;
+/// probes\wcwatch): what reads it shows in the frame time, and the reads the emulator makes
+/// are counted (`victory_gpu::memclass`). Write-combined memory takes the kernel's write watch
+/// (probed); should that fail, the caller makes it again without.
+fn honoured_protection(asked: u32, protect: u32, kind: u32, fresh: bool, size: usize) -> Option<u32> {
+    use victory_gpu::memclass::{honour_wc, honour_wc_min_bytes};
+    if !honour_wc() {
+        return None;
+    }
+    honour_policy(honour_wc_min_bytes(), asked, protect, kind, fresh, size)
+}
+
+/// [`honoured_protection`] with the switch on and `min` its least size.
+fn honour_policy(min: usize, asked: u32, protect: u32, kind: u32, fresh: bool, size: usize) -> Option<u32> {
+    use victory_gpu::memclass::{CONSOLE_NOCACHE, CONSOLE_WRITECOMBINE, Class, classify};
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOCACHE, PAGE_READONLY, PAGE_WRITECOMBINE,
+    };
+    if !fresh
+        || kind & MEM_COMMIT == 0
+        || asked & (CONSOLE_WRITECOMBINE | CONSOLE_NOCACHE) == 0
+        || classify(asked, false) != Class::WcGpuPrivate
+        || size < min
+        || !matches!(protect, PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)
+    {
+        return None;
+    }
+    Some(protect | if asked & CONSOLE_NOCACHE != 0 { PAGE_NOCACHE } else { PAGE_WRITECOMBINE })
+}
+
+/// LOCAL (gpu-first): for [`honoured_protection`]'s allocations that are write-watched: the
+/// error if the kernel's write watch does not answer for it (then it is made again without).
+fn write_watch_refused(at: *mut c_void, size: usize, kind: u32) -> Option<std::io::Error> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    if kind & MEM_WRITE_WATCH == 0 {
+        return None;
+    }
+    let mut found = [std::ptr::null_mut::<c_void>(); 1];
+    let (mut count, mut granularity) = (found.len(), 0u32);
+    // SAFETY: room for `count` entries; without the reset flag nothing changes.
+    let failed = unsafe { GetWriteWatch(0, at, size, found.as_mut_ptr(), &mut count, &mut granularity) } != 0;
+    failed.then(std::io::Error::last_os_error)
 }
 
 /// What the title asks its memory to be (the console's protection, with the
@@ -226,6 +441,8 @@ pub extern "system" fn XMemVirtualQuery(
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // LOCAL (heap-probe): as in `title_virtual_query`.
+    let _probe = victory_gpu::heapprobe::emulator_reading(address as usize, 1);
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
@@ -233,6 +450,8 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
+        // LOCAL (wc-vram): title memory in card memory, as the title asked for it.
+        wc_vram_query(address as usize, &mut info.host);
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -360,6 +579,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // LOCAL (gpu-first): the class registry (off unless asked for).
+            victory_gpu::memclass::released(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -392,6 +613,38 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// LOCAL: made with `SEC_COMMIT` on Windows ([`pool_commit`]): every
+    /// page is committed from the start, in every view of it, and nothing
+    /// is committed page by page (`commit` would only ask the host for
+    /// what it has). Its bits in `committed` are all set. False under Wine,
+    /// where `commit` does nothing anyway.
+    whole: bool,
+}
+
+/// LOCAL: `VICTORY_POOL_COMMIT=1`: the page pool's sections
+/// (`XMemAllocatePhysicalPages`) are made with `SEC_COMMIT` on Windows too,
+/// as under Wine, instead of `SEC_RESERVE` with each page committed when
+/// first shown. Only such a section can be opened as a host heap, which
+/// `VICTORY_INPLACE_VIEWS` needs (`victory_gpu::inplace`). The whole of it
+/// is charged to the system's commit at once (the title asks for 6.1 GiB
+/// in one call); if the host refuses that, the section is made reserved as
+/// before. Off (unset or anything but 1): as before.
+fn pool_commit() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// LOCAL: the system's commit charge and limit in MiB, for the log of a
+/// committed page pool.
+fn system_commit_mib() -> Option<(usize, usize)> {
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+    queried.then(|| (info.CommitTotal * info.PageSize / MIB, info.CommitLimit * info.PageSize / MIB))
 }
 
 impl Section {
@@ -448,6 +701,10 @@ impl Section {
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
         use std::sync::atomic::Ordering;
+        // LOCAL: committed whole when made ([`pool_commit`]).
+        if self.whole {
+            return true;
+        }
         let pages = index..(index + len / PAGE).min(self.pages);
         let bit = |p: usize| (&self.committed[p / 64], 1 << (p % 64));
         let done = || {
@@ -637,6 +894,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    allocate_physical(flags, count, pages, pool_commit())
+}
+
+/// LOCAL: [`XMemAllocatePhysicalPages`], the section made committed on
+/// Windows too if `whole` ([`pool_commit`]; the tests ask for it directly).
+fn allocate_physical(flags: u64, count: *mut usize, pages: *mut usize, whole: bool) -> BOOL {
     if count.is_null() || pages.is_null() {
         return 0;
     }
@@ -648,21 +911,51 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let create = |commit: bool| {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if commit { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        }
     };
+    // Under Wine a committed section is a sparse file, free until
+    // touched, and committing a reserved one page by page costs a
+    // wineserver request each that scans every range committed so
+    // far: commit it whole there.
+    // LOCAL: and on Windows with `VICTORY_POOL_COMMIT=1`, all of it charged
+    // to the system's commit now; reserved as before if the host refuses.
+    let mut whole = whole && !on_wine();
+    let before = if whole { system_commit_mib() } else { None };
+    let mut handle = create(on_wine() || whole);
+    if whole {
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(
+                n,
+                mib = size / MIB,
+                %error,
+                "the page pool's section not made committed (VICTORY_POOL_COMMIT): reserved instead, and not opened in place"
+            );
+            whole = false;
+            handle = create(false);
+        } else {
+            let after = system_commit_mib();
+            tracing::info!(
+                n,
+                mib = size / MIB,
+                commit_before_mib = before.map(|b| b.0),
+                commit_after_mib = after.map(|a| a.0),
+                commit_limit_mib = after.map(|a| a.1),
+                "the page pool's section made committed (VICTORY_POOL_COMMIT): all of it charged to the system's commit now"
+            );
+        }
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -677,12 +970,17 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    // LOCAL: also made so on Windows ([`pool_commit`]).
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || whole);
     let section = Arc::new(Section {
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        // LOCAL: every page of a section made committed is.
+        committed: (0..n.div_ceil(64))
+            .map(|_| std::sync::atomic::AtomicU64::new(if whole { u64::MAX } else { 0 }))
+            .collect(),
+        whole,
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -751,7 +1049,8 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        // LOCAL: a section made committed has nothing to commit.
+        if !slice.section.whole && !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -952,12 +1251,29 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // LOCAL (gpu-first): streaming by class (`VICTORY_CLASS_STATS`; off: nothing asked).
+    let mut placed = 0;
+    // LOCAL (page-kinds): also collect physical-page destinations for the read-only meter.
+    let classing = victory_gpu::memclass::stats_on() || victory_gpu::pagekinds::on();
     for (at, bytes) in shown_at(pages, offset, len) {
-        if stream_notice() {
+        // LOCAL (heap-probe): DirectStorage's bytes in the range followed (`VICTORY_HEAP_PROBE=1`).
+        victory_gpu::heapprobe::dstorage(at, bytes);
+        if classing {
+            victory_gpu::memclass::streamed(at, bytes);
+            placed += bytes;
+        }
+        // LOCAL (journal): journaled, and the guarded blocks under it told as written
+        // beside their guards rather than opened (`VICTORY_STREAM_JOURNAL=1`; off: as before).
+        if victory_gpu::stream_journal::on() {
+            victory_gpu::stream_journal::wrote_pages(at, bytes, stream_notice());
+        } else if stream_notice() {
             victory_gpu::kernel_will_write(at, bytes);
         } else {
             victory_gpu::title_memory_written(at, bytes, true);
         }
+    }
+    if classing && placed < len {
+        victory_gpu::memclass::streamed_unplaced(len - placed);
     }
 }
 
@@ -1088,6 +1404,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    // LOCAL (heap-probe): a mapping call that touches the range followed (`VICTORY_HEAP_PROBE=1`).
+    victory_gpu::heapprobe::note_call(
+        if pages.is_some() { victory_gpu::heapprobe::Call::Map } else { victory_gpu::heapprobe::Call::Unmap },
+        base,
+        n.saturating_mul(PAGE),
+    );
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let _busy = Busy::begin();
@@ -1142,6 +1464,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    // LOCAL (heap-probe): a mapping call that touches the range followed (`VICTORY_HEAP_PROBE=1`).
+    if victory_gpu::heapprobe::on() {
+        // SAFETY: the title passes `n` addresses.
+        let each = (0..n).map(|i| (unsafe { *addresses.add(i) } as usize, PAGE));
+        victory_gpu::heapprobe::note_calls(victory_gpu::heapprobe::Call::Scatter, each);
+    }
     lift_thread();
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
@@ -1179,6 +1507,13 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    // LOCAL (heap-probe): a mapping call that touches the range followed (`VICTORY_HEAP_PROBE=1`).
+    if victory_gpu::heapprobe::on() {
+        victory_gpu::heapprobe::note_calls(
+            victory_gpu::heapprobe::Call::Alias,
+            [(to, len), (from, if from != 0 { len } else { 0 })].into_iter(),
+        );
+    }
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
@@ -1216,6 +1551,15 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         .collect();
     if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+    }
+    // LOCAL (heap-probe): the call's ranges, as `map_alias` counts its own (`VICTORY_HEAP_PROBE=1`).
+    if victory_gpu::heapprobe::on() {
+        victory_gpu::heapprobe::note_calls(
+            victory_gpu::heapprobe::Call::Alias,
+            ranges.iter().flat_map(|&(to, from, len)| {
+                [(to as usize, len as usize), (from as usize, if from != 0 { len as usize } else { 0 })]
+            }),
+        );
     }
     let mut ok = true;
     let mut at = 0;
@@ -1872,16 +2216,27 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // LOCAL (wc-vram): a block in card memory (`VICTORY_WC_VRAM`), which the host's call refuses.
+    // Off: one relaxed load.
+    if victory_gpu::wc_vram::touches(address as usize, size.max(1))
+        && let Some(done) = wc_vram_free(address as usize, size, kind)
+    {
+        return done;
+    }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        // LOCAL (gpu-first): the class registry (off unless asked for).
+        if kind & MEM_RELEASE != 0 {
+            victory_gpu::memclass::released(address as usize);
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
 }
 
 pub(crate) fn module() -> HleModule {
-    HleModule {
+    let mut module = HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
         exports: vec![
@@ -1900,7 +2255,21 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
         ],
+    };
+    // LOCAL (wc-vram): the title's protection changes and queries of its blocks in card memory
+    // (`VICTORY_WC_VRAM=1` only; off, the title calls the host's as before).
+    if victory_gpu::wc_vram::on() {
+        module.exports.push(crate::HleExport { name: "VirtualProtect", address: title_virtual_protect as *const () as usize });
+        module.exports.push(crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize });
+        module.exports.push(crate::HleExport { name: "VirtualAlloc", address: title_virtual_alloc as *const () as usize });
+    } else if victory_gpu::heapprobe::on() {
+        // LOCAL (heap-probe): the title's protection changes and queries must not meet a page of
+        // the probe's (`VICTORY_HEAP_PROBE=1`; the functions pass over blocks in card memory
+        // only when there are any).
+        module.exports.push(crate::HleExport { name: "VirtualProtect", address: title_virtual_protect as *const () as usize });
+        module.exports.push(crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize });
     }
+    module
 }
 
 #[cfg(test)]
@@ -1914,6 +2283,103 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    // LOCAL (gpu-first): which allocations `VICTORY_HONOUR_WC` makes write-combined.
+    #[test]
+    fn honour_policy_picks_private_committed_wc_gpu_memory() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOCACHE, PAGE_WRITECOMBINE};
+        let fresh_commit = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+        // The 1277 MB block: protection 0x2404, kind 0x203000.
+        assert_eq!(
+            honour_policy(0, 0x2404, PAGE_READWRITE, fresh_commit, true, 1277 << 20),
+            Some(PAGE_READWRITE | PAGE_WRITECOMBINE)
+        );
+        // Uncached asked: uncached.
+        assert_eq!(honour_policy(0, 0x2204, PAGE_READWRITE, fresh_commit, true, 1 << 20), Some(PAGE_READWRITE | PAGE_NOCACHE));
+        // Below the least size, cached GPU memory, CPU-only write-combined memory, a reservation,
+        // a commit in a reservation or for physical pages (not fresh), no access: as before.
+        assert_eq!(honour_policy(1024 << 20, 0x2404, PAGE_READWRITE, fresh_commit, true, 1023 << 20), None);
+        assert_eq!(honour_policy(0, 0x2004, PAGE_READWRITE, fresh_commit, true, 1 << 20), None);
+        assert_eq!(honour_policy(0, 0x404, PAGE_READWRITE, fresh_commit, true, 1 << 20), None);
+        assert_eq!(honour_policy(0, 0x2404, PAGE_READWRITE, MEM_RESERVE, true, 1 << 20), None);
+        assert_eq!(honour_policy(0, 0x2404, PAGE_READWRITE, MEM_COMMIT, false, 1 << 20), None);
+        assert_eq!(honour_policy(0, 0x2404, PAGE_NOACCESS, fresh_commit, true, 1 << 20), None);
+    }
+
+    // LOCAL (wc-vram): a block in card memory (what `VICTORY_WC_VRAM=1` makes of the title's
+    // write-combined GPU block) answers the title's queries as the allocation it asked for, takes
+    // its protection changes and commits as no-ops, zeroes what it decommits, and is parked when
+    // released (the host's calls all fail on the mapping). Skipped without a card with a BAR.
+    #[test]
+    fn a_block_in_card_memory_takes_the_titles_calls() {
+        use windows_sys::Win32::System::Memory::{MEM_PRIVATE, PAGE_READONLY};
+        const MEM_DECOMMIT: u32 = 0x4000;
+        let size = 64 << 20;
+        let kind = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+        let Some(at) = wc_vram_alloc(0x2404, PAGE_READWRITE, kind, 0, size, 1 << 32, (1 << 40) - 1) else {
+            eprintln!("no card memory mapped through a BAR here; skipped");
+            return;
+        };
+        let a = at as usize;
+        assert!(a + size <= 1 << 40 && victory_gpu::wc_vram::holds(a, size));
+        // Not taken: CPU-cached GPU memory, or below the least size.
+        assert!(wc_vram_alloc(0x2004, PAGE_READWRITE, kind, 0, size, 1 << 32, (1 << 40) - 1).is_none());
+        assert!(wc_vram_alloc(0x2404, PAGE_READWRITE, kind, 0, 1 << 20, 1 << 32, (1 << 40) - 1).is_none());
+        // Queries: the allocation as asked for.
+        let info = query((a + 0x5123) as *const c_void);
+        assert_eq!(info.host.AllocationBase as usize, a);
+        assert_eq!(info.host.BaseAddress as usize, a + 0x5000);
+        assert_eq!(info.host.RegionSize, size - 0x5000);
+        assert_eq!((info.host.State, info.host.Protect, info.host.Type), (MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE));
+        assert_eq!(info.flags, GRAPHICS);
+        // SAFETY: plain data, filled in by the call.
+        let mut host: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_eq!(title_virtual_query(at, &mut host, size_of::<MEMORY_BASIC_INFORMATION>()), size_of::<MEMORY_BASIC_INFORMATION>());
+        assert_eq!((host.AllocationBase as usize, host.RegionSize, host.AllocationProtect), (a, size, PAGE_READWRITE));
+        // A protection change: passed over, the old protection read-write, still writable.
+        let mut old = 0;
+        assert_eq!(title_virtual_protect(at, 4096, PAGE_READONLY, &mut old), 1);
+        assert_eq!(old, PAGE_READWRITE);
+        // SAFETY: the block's memory (read back below by a few plain loads only).
+        unsafe { std::ptr::write_bytes(at.cast::<u8>(), 0x33, 0x30000) };
+        // A commit inside: the address itself.
+        let inside = (a + 0x10000) as *mut c_void;
+        assert_eq!(XMemVirtualAlloc(inside, 0x10000, MEM_COMMIT, 0, 0x2404), inside);
+        // A decommit: zeros there, the rest kept.
+        assert_eq!(title_virtual_free(inside, 0x10000, MEM_DECOMMIT), 1);
+        // SAFETY: the block's memory, a few words.
+        let word = |off: usize| unsafe { ((a + off) as *const u64).read_volatile() };
+        assert_eq!((word(0xfff8), word(0x10000), word(0x1fff8), word(0x20000)), (0x3333_3333_3333_3333, 0, 0, 0x3333_3333_3333_3333));
+        // A release: of the block's base only; then it is no title memory of ours.
+        assert_eq!(title_virtual_free(inside, 0, MEM_RELEASE), 0);
+        assert_eq!(title_virtual_free(at, 0, MEM_RELEASE), 1);
+        assert!(!victory_gpu::wc_vram::touches(a, size));
+    }
+
+    // LOCAL (gpu-first): write-combined host memory takes the kernel's write watch, as
+    // `write_watch_refused` checks (probed: GetWriteWatch answers for it).
+    #[test]
+    fn write_combined_memory_is_write_watched() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, PAGE_WRITECOMBINE};
+        const SIZE: usize = 1 << 20;
+        let kind = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+        // SAFETY: a fresh allocation of ours.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), SIZE, kind, PAGE_READWRITE | PAGE_WRITECOMBINE) };
+        assert!(!p.is_null(), "{}", std::io::Error::last_os_error());
+        assert!(write_watch_refused(p, SIZE, kind).is_none());
+        // SAFETY: inside the allocation.
+        unsafe {
+            let mut found = [std::ptr::null_mut::<c_void>(); 16];
+            let (mut count, mut granularity) = (found.len(), 0u32);
+            assert_eq!(GetWriteWatch(1, p, SIZE, found.as_mut_ptr(), &mut count, &mut granularity), 0);
+            p.cast::<u8>().add(3 * 4096).write_volatile(1);
+            let mut count = found.len();
+            assert_eq!(GetWriteWatch(1, p, SIZE, found.as_mut_ptr(), &mut count, &mut granularity), 0);
+            assert_eq!(count, 1);
+            assert_eq!(found[0] as usize, p as usize + 3 * 4096);
+            assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+        }
     }
 
     #[test]
@@ -2098,6 +2564,67 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// LOCAL: a page pool made committed (`VICTORY_POOL_COMMIT=1`) maps,
+    /// aliases, unmaps and takes DirectStorage's writes as a reserved one
+    /// does, with nothing committed page by page.
+    #[test]
+    fn committed_physical_pages_map_alias_and_unmap() {
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(allocate_physical(0, &mut n, pages.as_mut_ptr(), true), 1);
+        assert_eq!(n, 4);
+        let section = page_table().pages[&pages[0]].section.clone();
+        assert_eq!(section.whole, !on_wine());
+        let reserve = || {
+            XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE)
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        for page in 0..4 {
+            assert_eq!(query(at(a, page)).host.State, MEM_COMMIT);
+        }
+        // An alias of page 3, written through either address.
+        assert_eq!(XMemMapPhysicalPages(at(b, 2), 1, pages[3..].as_ptr()), at(b, 2));
+        // SAFETY: both mapped read-write.
+        unsafe {
+            at(a, 3).cast::<u8>().write(5);
+            assert_eq!(at(b, 2).cast::<u8>().read(), 5);
+            at(b, 2).cast::<u8>().add(1).write(6);
+            assert_eq!(at(a, 3).cast::<u8>().add(1).read(), 6);
+        }
+        // DirectStorage's writes: through the section's kept view, and
+        // through a window of its own.
+        assert!(write_physical(&pages[3..], 2, &[7]));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(b, 2).cast::<u8>().add(2).read() }, 7);
+        let mut window = page_window(&pages, PAGE + 4, 8).expect("one run");
+        window.bytes().copy_from_slice(&[8; 8]);
+        drop(window);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(a, 1).cast::<u8>().add(4).read() }, 8);
+        // Unmapping a page in the middle of the view keeps the others, with
+        // their bytes, and maps nothing reserved.
+        assert_eq!(XMemMapPhysicalPages(at(a, 1), 1, std::ptr::null()), at(a, 1));
+        assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(a, 2)).host.State, MEM_COMMIT);
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { at(a, 3).cast::<u8>().read() }, 5);
+        // Mapped again, the page shows what it held.
+        assert_eq!(XMemMapPhysicalPagesScatter([at(a, 1)].as_ptr(), 1, pages[1..].as_ptr()), 1);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(a, 1).cast::<u8>().add(4).read() }, 8);
+        assert!(map_alias(at(b, 0) as u64, at(a, 3) as u64, PAGE as u64));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(b, 0).cast::<u8>().read() }, 5);
+        for p in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(p, 4, std::ptr::null()), p);
+        }
+        drop(section);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

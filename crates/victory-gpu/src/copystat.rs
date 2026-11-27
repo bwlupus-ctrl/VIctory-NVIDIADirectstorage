@@ -848,10 +848,14 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
-    tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
-        crate::resource::placed_filler_twins()
-    );
+    // LOCAL (upstream-port 5b36758): counted only with
+    // `VICTORY_PLACED_TWINS_STATS=1`.
+    match crate::resource::placed_filler_twins() {
+        Some(twins) => tracing::info!(
+            "memory, placed textures: {twins} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)"
+        ),
+        None => tracing::info!("memory, placed textures: filler twins not counted (VICTORY_PLACED_TWINS_STATS=1 counts them)"),
+    }
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
     // code has allocated.
@@ -899,7 +903,11 @@ fn log_memory() {
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
-         views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
+         views and {} views of placed memory; shapes of placed views kept: {} (LOCAL (views): {} fell back to table entries \
+         when the shapes were full, {} entries of memory views recycled; LOCAL (views2): {} min-LOD clamps \
+         and {} bare shapes for them interned; placed views with a clamp that did not fit a \
+         record: {} unaligned or out of range, {} with the bare shapes full, {} with the clamps \
+         full); host lists: {} \
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
@@ -910,6 +918,13 @@ fn log_memory() {
         views[3],
         views[4],
         views[5],
+        views[8],
+        views[9],
+        views[10],
+        views[11],
+        views[12],
+        views[13],
+        views[14],
         lists[0],
         lists[1],
         lists[2] as i64 as f64 / (1 << 20) as f64,

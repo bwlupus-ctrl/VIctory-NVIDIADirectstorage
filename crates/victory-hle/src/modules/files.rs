@@ -77,6 +77,10 @@ pub fn mount_at(letter: char, root: &Path) {
     // SAFETY: no arguments.
     let hides_host_drive = unsafe { GetLogicalDrives() } >> index & 1 != 0;
     tracing::info!(drive = %letter, root = %root.display(), hides_host_drive, "virtual drive");
+    // LOCAL: the read map records files of the package, the `G:` drive.
+    if letter == 'G' {
+        super::read_map::set_root(root);
+    }
     let mut drives = drives();
     drives.retain(|(l, _)| u32::from(*l) != u32::from(letter));
     drives.push((letter as u16, root_wide(root)));
@@ -258,6 +262,34 @@ fn widen(mode: *const c_char) -> Vec<u16> {
 type Handle = *mut c_void;
 type File = *mut c_void;
 
+/// LOCAL: a handle the title was given, noted for the read map
+/// (`VICTORY_READ_MAP`) if one is recorded.
+fn opened(handle: Handle) -> Handle {
+    if super::read_map::on() {
+        super::read_map::handle_opened(handle);
+    }
+    handle
+}
+
+/// LOCAL: as [`opened`], for a stream; `tracked`: its reads reach our
+/// `fread` (the C++ library's own, after `_Fiopen`, do not).
+fn opened_stream(stream: File, tracked: bool) -> File {
+    if super::read_map::on() {
+        super::read_map::stream_opened(stream, tracked);
+    }
+    stream
+}
+
+/// LOCAL: as [`opened_stream`], for the calls that return an error and
+/// store the stream.
+fn opened_stream_at(error: i32, out: *mut File) -> i32 {
+    if error == 0 && !out.is_null() && super::read_map::on() {
+        // SAFETY: the call succeeded, so it stored a stream at `out`.
+        super::read_map::stream_opened(unsafe { *out }, true);
+    }
+    error
+}
+
 // kernel32 and its file API sets.
 
 pub extern "system" fn CreateFileW(
@@ -270,7 +302,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    opened(host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
         share,
@@ -278,7 +310,7 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    ))
 }
 
 pub extern "system" fn CreateFileA(
@@ -290,7 +322,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    match narrow(path) {
+    opened(match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
@@ -313,7 +345,7 @@ pub extern "system" fn CreateFileA(
                 template,
             )
         }
-    }
+    })
 }
 
 /// Used by Bink.
@@ -325,13 +357,13 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+    opened(host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
         share,
         disposition,
         params,
-    )
+    ))
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
@@ -500,25 +532,30 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    opened_stream(
+        host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode),
+        true,
+    )
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+    let error = host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
         p.ptr(),
         mode,
-    )
+    );
+    opened_stream_at(error, out)
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+    let stream = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
         mode,
         share,
-    )
+    );
+    opened_stream(stream, true)
 }
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
@@ -535,6 +572,46 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    // LOCAL: the read map: where this read is, asked before it moves the
+    // file pointer.
+    if super::read_map::on() {
+        super::read_map::handle_read(file, len, overlapped);
+    }
+    // LOCAL (wc-vram): a read into a block in card memory (`VICTORY_WC_VRAM`): a synchronous one
+    // goes through a buffer of ours and is written in (the kernel's unbuffered transfer into
+    // the BAR is not known to work, and a failed read is retried forever by the title); an
+    // overlapped one is left to the kernel, counted. Off: one relaxed load.
+    if len != 0 && victory_gpu::wc_vram::touches(buffer as usize, len as usize) {
+        use victory_gpu::wc_vram::{Count, count};
+        if overlapped.is_null() && victory_gpu::wc_vram::holds(buffer as usize, len as usize) {
+            count(Count::ReadsBounced, 1);
+            let mut aside = vec![0u8; len as usize];
+            let mut got = 0u32;
+            let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+                file,
+                aside.as_mut_ptr(),
+                len,
+                &mut got,
+                std::ptr::null_mut(),
+            );
+            // SAFETY: plain calls.
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            let got = got.min(len) as usize;
+            // SAFETY: the title's buffer holds `len` bytes, all of them in the block.
+            unsafe { victory_gpu::wc_vram::write_stream(buffer, &aside[..got]) };
+            victory_gpu::title_memory_written(buffer as usize, got, false);
+            if !read.is_null() {
+                // SAFETY: the title's out pointer.
+                unsafe { read.write(got as u32) };
+            }
+            // SAFETY: the read's own error, for the title to ask for.
+            unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+            return done;
+        }
+        count(Count::ReadsAsync, 1);
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!(len, "wc-vram: an overlapped ReadFile into card memory, left to the kernel"));
+    }
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
@@ -570,6 +647,10 @@ pub extern "system" fn ReadFile(
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+    // LOCAL: the read map, as in `ReadFile`.
+    if super::read_map::on() {
+        super::read_map::stream_read(stream, size.saturating_mul(count));
+    }
     let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
@@ -577,6 +658,10 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
+    opened_stream(fopen_host(path, mode), true)
+}
+
+fn fopen_host(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
             p.as_ptr(),
@@ -591,6 +676,10 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 }
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
+    opened_stream_at(fopen_s_host(out, path, mode), out)
+}
+
+fn fopen_s_host(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
             host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
@@ -681,15 +770,20 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
-    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+    let stream = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
         p.ptr(),
         mode,
         protection,
-    )
+    );
+    opened_stream(stream, false)
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
+    opened_stream(fiopen_host(path, mode, protection), false)
+}
+
+fn fiopen_host(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
         Some(p) => {
             host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
@@ -706,7 +800,44 @@ extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     }
 }
 
+/// LOCAL: with a read map recorded (`VICTORY_READ_MAP`), the title's closes
+/// come through here too, so a handle or stream value the host gives out
+/// again is not taken for the file it was. Without one they are the host's
+/// own, as before.
+extern "system" fn close_handle(handle: Handle) -> i32 {
+    super::read_map::handle_closed(handle);
+    host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle)
+}
+
+/// LOCAL: see [`close_handle`].
+extern "C" fn close_stream(stream: File) -> i32 {
+    super::read_map::stream_closed(stream);
+    host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(stream)
+}
+
 pub(crate) fn module() -> HleModule {
+    let mut module = module_as_before();
+    // LOCAL: see `close_handle`.
+    if super::read_map::on() {
+        module.dlls = &[
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-file-*",
+            "api-ms-win-core-processenvironment-*",
+            "ucrtbase.dll",
+            "api-ms-win-crt-stdio-*",
+            "api-ms-win-crt-filesystem-*",
+            "api-ms-win-crt-time-*",
+            "msvcp140.dll",
+            "api-ms-win-core-handle-*",
+        ];
+        module.exports.push(HleExport { name: "CloseHandle", address: close_handle as *const () as usize });
+        module.exports.push(HleExport { name: "fclose", address: close_stream as *const () as usize });
+    }
+    module
+}
+
+fn module_as_before() -> HleModule {
     HleModule {
         name: "files",
         dlls: &[

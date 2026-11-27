@@ -201,6 +201,8 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
                 .iter()
                 .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
             Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
+            // LOCAL (port of cool_fox 8cc31ab): a movie plane's read.
+            Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
             _ => false,
         })
     })
@@ -440,6 +442,12 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                         asked: touches(written, at, at + len),
                     }
                 }
+                // LOCAL (port of cool_fox 8cc31ab): a movie plane's read.
+                &Step::Plane((at, len), _) => Does::Read {
+                    from: at,
+                    to: at.saturating_add(len),
+                    asked: touches(written, at, at.saturating_add(len)),
+                },
                 &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
@@ -616,9 +624,16 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// LOCAL (vram-tune): the block bytes its list reads on the card ([`Host::wc_fills`]).
+    read: Vec<(usize, usize)>,
 }
 
 impl Taken {
+    /// LOCAL (vram-tune): the block bytes its list reads on the card (`crate::host::CARD_READS`).
+    pub(super) fn card_reads(&self) -> Vec<(usize, usize)> {
+        self.read.clone()
+    }
+
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
     }
@@ -853,7 +868,131 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            read: Vec::new(),
         }))
+    }
+
+    /// LOCAL (vram-tune): `VICTORY_WC_VRAM_GPU_FILLS=1` (`crate::wc_vram::gpu_fills`), sent ahead
+    /// (`late`) where [`Host::card_steps`] took nothing: the fills of `runs` out of a block in card
+    /// memory into upload memory that a descriptor slot alone shows (constant views of tables off
+    /// 256 bytes, `HostList::defer_constants`) are copied on the card, in a list of ours in front
+    /// of the submission's, out of the buffer over the block's heap into the buffer between, and
+    /// the slots pointed there (as stage 1 above does). `None` if there are none.
+    ///
+    /// Why the card's copy reads what the CPU's would have: it runs behind every flight sent
+    /// before (one queue; the level's barrier first), so what they wrote is there, without the
+    /// CPU's wait for them (`crate::host::writer_fence`); and behind every step of the submission
+    /// done on the CPU at preparing, so only fills that no later step could change on the CPU are
+    /// taken: those behind the last step of ours (`Step::Run`, anything anywhere) and the last
+    /// copy into a block (`Step::Copy`, `Step::Placed`). The submission's own lists run behind it,
+    /// as the CPU's fill was before them. What differs: a title CPU store into those bytes after
+    /// the submission was prepared and before the card reads them is seen (as by the constants
+    /// bound in the block in place, and on the console); with the CPU fill it was not.
+    pub(super) fn wc_fills(&self, runs: &[&HostList]) -> Option<Taken> {
+        if !crate::wc_vram::gpu_fills() {
+            return None;
+        }
+        self.fills_on_card(runs)
+    }
+
+    /// [`Host::wc_fills`], switched on.
+    fn fills_on_card(&self, runs: &[&HostList]) -> Option<Taken> {
+        let wholes = crate::wc_vram::wholes();
+        if wholes.is_empty() {
+            return None;
+        }
+        // Fills behind the last step that may write title memory on the CPU: (list, place,
+        // source, bytes, heap, slot).
+        let mut fills: Vec<(usize, usize, usize, usize, usize, u32)> = Vec::new();
+        let mut left = 0usize;
+        for list in runs {
+            let at = std::ptr::from_ref::<HostList>(list) as usize;
+            for (i, step) in list.deferred().copies.iter().enumerate() {
+                match step {
+                    Step::Run(_) => {
+                        left += fills.len();
+                        fills.clear();
+                    }
+                    &Step::Copy(dst, _, len) if crate::wc_vram::touches(dst, len) => {
+                        left += fills.len();
+                        fills.clear();
+                    }
+                    Step::Placed(p) if crate::wc_vram::touches(p.dst, p.len) => {
+                        left += fills.len();
+                        fills.clear();
+                    }
+                    &Step::Fill(_, src, len, Some(FillTo::Slot(heap, index))) if len > 0 && crate::wc_vram::holds(src, len) => {
+                        fills.push((at, i, src, len, heap, index));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if left > 0 {
+            crate::wc_vram::count(crate::wc_vram::Count::GpuFillsLeft, 1);
+        }
+        if fills.is_empty() {
+            return None;
+        }
+        let _spent = crate::timeline::span("fills out of card memory done on the card");
+        let Some(own) = self.own_list() else {
+            crate::wc_vram::count(crate::wc_vram::Count::GpuFillsLeft, 1);
+            return None;
+        };
+        // Each place read once; as many as the buffer between holds (the rest on the CPU).
+        let mut places: HashMap<(usize, usize), u64> = HashMap::default();
+        let mut reads: Vec<(&ID3D12Resource, u64, u64, u64)> = Vec::new();
+        let mut slots: Vec<(usize, u32, u64, u32)> = Vec::new();
+        let mut steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> = Default::default();
+        let mut end = 0u64;
+        for &(list, i, src, len, heap, index) in &fills {
+            let Some((base, _, whole)) = wholes.iter().find(|(base, bytes, _)| *base <= src && src + len <= base + bytes) else {
+                continue;
+            };
+            let at = match places.get(&(src, len)) {
+                Some(&at) => at,
+                None => {
+                    if end + len as u64 > BETWEEN || places.len() >= MOST {
+                        continue;
+                    }
+                    let at = end;
+                    end = (end + len as u64).next_multiple_of(256);
+                    places.insert((src, len), at);
+                    reads.push((whole, (src - base) as u64, at, len as u64));
+                    at
+                }
+            };
+            slots.push((heap, index, at, len as u32));
+            steps.insert((list, i));
+        }
+        if steps.is_empty() {
+            // (Closed, as a landed one is, before it goes back to the pool.)
+            own.list.close();
+            Taken { own, steps, copied: Vec::new(), read: Vec::new() }.landed();
+            crate::wc_vram::count(crate::wc_vram::Count::GpuFillsLeft, 1);
+            return None;
+        }
+        for (_, _, whole) in &wholes {
+            own.list.keep(whole);
+        }
+        #[cfg(feature = "diagnostics")]
+        own.list.note_op(|| format!("{} fills out of card memory done on the card, {end} bytes (VICTORY_WC_VRAM_GPU_FILLS)", slots.len()));
+        record(true, &own.list.list, &own.between, &reads, &[]);
+        own.list.close();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { own.between.GetGPUVirtualAddress() };
+        // (A slot always on the same thread, in the steps' order, as above.)
+        let parts = if slots.len() < 256 { 1 } else { 8 };
+        crate::land::each_under(parts, &|part| {
+            for &(heap, index, at, len) in &slots {
+                if index as usize / 4 % parts == part {
+                    crate::descriptor::constant_slot(heap, index, &own.between, gpu + at, len);
+                }
+            }
+        });
+        crate::wc_vram::count(crate::wc_vram::Count::GpuFills, slots.len() as u64);
+        let read = places.keys().map(|&(src, len)| (src, src + len)).collect();
+        Some(Taken { own, steps, copied: Vec::new(), read })
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -933,6 +1072,77 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LOCAL (vram-tune): the fills out of a block behind the last step of ours are copied on
+    /// the card into the buffer between, each place once; those ahead of it are left to the CPU
+    /// (`VICTORY_WC_VRAM_GPU_FILLS`).
+    #[test]
+    fn fills_out_of_card_memory_are_copied_on_the_card() {
+        let _turn = crate::wc_vram::tests::turn();
+        if !crate::wc_vram::tests::card_with_bar() {
+            return;
+        }
+        let host = host().expect("the host");
+        let at = crate::wc_vram::allocate(64 << 20, 1 << 32, (1 << 40) - 1).expect("a block");
+        let src = at + 0x1040;
+        let pattern: Vec<u8> = (0..0x70u32).map(|i| (i * 7 + 3) as u8).collect();
+        // SAFETY: the block's memory, as the title writes it.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), src as *mut u8, pattern.len()) };
+        crate::wc_vram::fence_stores();
+        let list = host.new_list().expect("a list");
+        let mut scratch = [0u8; 0x70];
+        let dst = scratch.as_mut_ptr();
+        // A fill ahead of a step of ours, then two of the same place behind it, and one of memory
+        // outside any block.
+        list.defer_constants(dst, src as *const u8, 0x70, (0, 1));
+        list.defer(|| {});
+        list.defer_constants(dst, src as *const u8, 0x70, (0, 2));
+        list.defer_constants(dst, src as *const u8, 0x70, (0, 3));
+        list.defer_constants(dst, scratch.as_ptr(), 0x70, (0, 4));
+        let taken = host.fills_on_card(&[&list]).expect("taken");
+        assert!(!taken.takes(&list, 0) && !taken.takes(&list, 1));
+        assert!(taken.takes(&list, 2) && taken.takes(&list, 3));
+        assert!(!taken.takes(&list, 4));
+        assert_eq!(taken.card_reads(), [(src, src + 0x70)], "what later CPU writes wait for");
+        // A later submission's copy into those bytes waits for it; one beside them, or a fill, not.
+        let later = host.new_list().expect("a list");
+        later.defer_fill(scratch.as_mut_ptr(), src as *const u8, 0x70);
+        later.defer_copy((src + 0x70) as *mut u8, scratch.as_ptr(), 0x10);
+        let reads = vec![(9, vec![(src, src + 0x70)])];
+        assert_eq!(super::card_reads_due(&reads, &[&later]), 0);
+        later.defer_copy((src + 0x60) as *mut u8, scratch.as_ptr(), 0x10);
+        assert_eq!(super::card_reads_due(&reads, &[&later]), 9);
+        // The list in front, then a copy of the buffer between where the CPU can read it.
+        let back = host.read_back_buffer(256).expect("a read-back buffer");
+        let check = host.new_list().expect("a list");
+        // SAFETY: open lists; live buffers.
+        unsafe {
+            check.list.CopyBufferRegion(&back, 0, &taken.own.between, 0, 0x70);
+        }
+        check.close();
+        for l in [&taken.own.list.list, &check.list] {
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            *submitted += 1;
+            // SAFETY: closed lists; the host's fence; no event: waits until it is reached.
+            unsafe {
+                host.queue.ExecuteCommandLists(&[Some(l.cast::<ID3D12CommandList>().unwrap())]);
+                host.queue.Signal(&host.fence, *submitted).unwrap();
+                host.fence.SetEventOnCompletion(*submitted, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            }
+        }
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the card is done with.
+        let got = unsafe {
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let got = std::slice::from_raw_parts(data.cast::<u8>(), 0x70).to_vec();
+            back.Unmap(0, None);
+            got
+        };
+        assert_eq!(got, pattern, "the block's bytes, copied on the card");
+        taken.landed();
+        drop(list);
+        assert!(crate::wc_vram::release(at));
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }

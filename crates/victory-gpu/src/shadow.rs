@@ -24,6 +24,89 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// LOCAL (polska, port of POLSKAGUROM 93f36ba): `VICTORY_BUFFER_TIERS=1`: copies in the
+/// card's memory known to need nothing back from the card ([`Shadow::skips_readback`])
+/// get no hashes, compares or fetches. Off by default.
+///
+/// Unlike 93f36ba, where every copy started as one that skips ("upload") until a
+/// declared write made it coherent (so writes through views nobody declared, which
+/// `crate::picked` looks for, were missed), a copy is coherent unless its bytes lie
+/// wholly in a range registered as needing no read-back ([`register_non_uma_range`]):
+/// so far only the arenas of `crate::memory`, whose structures stay on the card.
+pub(crate) fn buffer_tiers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_TIERS").is_some_and(|v| v == "1"))
+}
+
+/// LOCAL (polska): what is known of who writes a copy ([`buffer_tiers_on`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum BufferTier {
+    /// Written by the card, read only by the card: nothing comes back.
+    Tier1GpuPrivate = 1,
+    /// Written only by the CPU: nothing comes back.
+    Tier2Upload = 2,
+    /// Anything else, and anything not known: as before.
+    Tier3Coherent = 3,
+}
+
+/// LOCAL (polska): why a range was registered ([`register_non_uma_range`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum RangeTag {
+    Generic,
+    BvhArena,
+    BvhScratch,
+    /// Its results must come back, whatever else lies over it.
+    ReadbackRequired,
+}
+
+/// LOCAL (polska): ranges of title address space and their tiers (start, bytes).
+static NON_UMA_RANGES: Mutex<Vec<(u64, u64, BufferTier, RangeTag)>> = Mutex::new(Vec::new());
+
+/// LOCAL (polska): `[start, start + len)` is of `tier` (one range per start).
+pub(crate) fn register_non_uma_range(start: u64, len: u64, tier: BufferTier, tag: RangeTag) {
+    if len == 0 {
+        return;
+    }
+    let mut ranges = NON_UMA_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.retain(|r| r.0 != start);
+    ranges.push((start, len, tier, tag));
+}
+
+/// LOCAL (polska): the range registered at `start` is no more.
+#[allow(dead_code)]
+pub(crate) fn unregister_non_uma_range(start: u64) {
+    NON_UMA_RANGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.0 != start);
+}
+
+/// LOCAL (polska): the tier of a copy of `[start, start + len)`: that of a registered
+/// range of tier 1 or 2 that holds all of it (tier 1 before 2), unless any part of it
+/// lies in a range that must be read back (or is coherent); else coherent. A copy that
+/// is only partly in such a range is coherent: the rest of it is not known.
+pub(crate) fn classify_non_uma_range(start: u64, len: u64) -> BufferTier {
+    if len == 0 {
+        return BufferTier::Tier3Coherent;
+    }
+    let end = start.saturating_add(len);
+    let ranges = NON_UMA_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = BufferTier::Tier3Coherent;
+    for &(b, b_len, tier, tag) in ranges.iter() {
+        let b_end = b.saturating_add(b_len);
+        if start >= b_end || b >= end {
+            continue;
+        }
+        if tag == RangeTag::ReadbackRequired || tier == BufferTier::Tier3Coherent {
+            return BufferTier::Tier3Coherent;
+        }
+        let holds = b <= start && end <= b_end;
+        if holds && (found == BufferTier::Tier3Coherent || tier == BufferTier::Tier1GpuPrivate) {
+            found = tier;
+        }
+    }
+    found
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -94,14 +177,20 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// LOCAL (polska): what is known of who writes it ([`BufferTier`], as a `u8`).
+    tier: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
-    /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// begins on a 64 KiB line; a title buffer need not). LOCAL: and
+    /// whether over a section of physical pages (`crate::inplace::place_view`).
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, bool)>,
+    /// LOCAL (wc-vram): with `place`, the title memory is a block in card memory
+    /// (`crate::wc_vram`, `VICTORY_WC_VRAM`), not memory opened in place.
+    wc: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -313,6 +402,14 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// LOCAL (port of cool_fox e05d463): bytes of buffer copies alive, for the
+/// line `crate::residency` writes when the host comes under memory pressure.
+pub(crate) fn live_span_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
@@ -1534,6 +1631,12 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // Helpers woken: one for each job beyond the one this thread takes
+    // first, at most all of them. All were woken for every call (4 for 2
+    // jobs), and those that found nothing went back to sleep; a helper busy
+    // meanwhile looks at the queue before it sleeps again, and this thread
+    // takes what nobody took.
+    let wake = (jobs.len() - 1).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1550,7 +1653,11 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    if wake >= wide_threads() {
+        workers.more.notify_all();
+    } else {
+        (0..wake).for_each(|_| workers.more.notify_one());
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -2105,6 +2212,36 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
     runs
 }
 
+/// LOCAL (journal): [`dword_runs`] of a piece of one page (from title address
+/// `at` on), but the 4 KiB parts `parts` names (a bit each, of the page `at`
+/// lies in) are taken whole, without comparing (DirectStorage wrote them
+/// after the copy took them).
+fn runs_with_fresh(at: usize, held: &[u8], title: &[u8], parts: u16) -> Vec<(usize, usize)> {
+    if parts == 0 {
+        return dword_runs(at, held, title, 0);
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let join = |runs: &mut Vec<(usize, usize)>, a: usize, n: usize| match runs.last_mut() {
+        Some((start, len)) if *start + *len >= a => *len = (*len).max(a + n - *start),
+        _ => runs.push((a, n)),
+    };
+    let mut off = 0;
+    while off < title.len() {
+        let here = at + off;
+        let next = ((here / KERNEL_PAGE + 1) * KERNEL_PAGE - at).min(title.len());
+        if parts >> (here % PAGE / KERNEL_PAGE) & 1 != 0 {
+            crate::stream_journal::count(crate::stream_journal::C::CompareSkipped, (next - off) as u64);
+            join(&mut runs, off, next - off);
+        } else {
+            for (a, n) in dword_runs(here, &held[off..next], &title[off..next], 0) {
+                join(&mut runs, off + a, n);
+            }
+        }
+        off = next;
+    }
+    runs
+}
+
 /// [`dword_runs`] with no gap, the fast way where it can be: a frame compares
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
@@ -2365,6 +2502,29 @@ mod merge_tests {
         unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
     }
 
+    /// LOCAL (journal): fresh parts whole, the rest by its dwords.
+    #[test]
+    fn runs_with_fresh_take_fresh_parts_whole_and_compare_the_rest() {
+        // LOCAL (journal)
+        let at = 0x5_0000usize + 0x800;
+        let held = vec![0u8; 0x2000];
+        let mut title = vec![0u8; 0x2000];
+        // A change in the first part (not fresh), none in the second (fresh: whole).
+        title[0x10] = 1;
+        let parts = 1u16 << ((at + 0x800) % super::PAGE / super::KERNEL_PAGE);
+        let runs = super::runs_with_fresh(at, &held, &title, parts);
+        assert_eq!(runs, vec![(0x10, 4), (0x800, 0x1000)]);
+        // Nothing fresh: the dword runs.
+        assert_eq!(super::runs_with_fresh(at, &held, &title, 0), super::dword_runs(at, &held, &title, 0));
+        // Every byte the dword runs name is in the runs with fresh parts too.
+        title[0x900] = 7;
+        title[0x1900] = 9;
+        let with = super::runs_with_fresh(at, &held, &title, parts);
+        for (a, n) in super::dword_runs(at, &held, &title, 0) {
+            assert!(with.iter().any(|&(b, m)| b <= a && a + n <= b + m), "{a:#x}+{n} not taken");
+        }
+    }
+
     /// Whole dwords around every changed byte and no other, whatever the
     /// alignment; small gaps joined only when asked.
     #[test]
@@ -2475,9 +2635,19 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        if self.place.is_some() {
+        if let Some(place) = &self.place {
+            // LOCAL (wc-vram): counted apart.
+            if self.wc {
+                crate::wc_vram::unbound(self.len);
+                return;
+            }
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            // LOCAL: a window over a view, apart.
+            if place.2 {
+                crate::inplace::gone_view(self.len, windows::core::Interface::as_raw(&self.buffer) as usize);
+            } else {
+                crate::inplace::gone(self.window, self.len);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2919,6 +3089,12 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// LOCAL (wc-vram): whether it is title memory in a block in card memory (`crate::wc_vram`).
+    #[allow(dead_code)]
+    pub(crate) fn wc_vram(&self) -> bool {
+        self.wc
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2937,7 +3113,16 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, placed.view));
+        shadow
+    }
+
+    /// LOCAL (wc-vram): title memory `[start, start + len)` in a block in card memory
+    /// (`crate::wc_vram::place`): shaped as a copy in place, as [`Shadow::placed`]; nothing is
+    /// watched, refreshed, sent to the card or copied back for it.
+    fn wc_placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+        let mut shadow = Shadow::placed(placed, start, len, window);
+        shadow.wc = true;
         shadow
     }
 
@@ -2987,8 +3172,37 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            // LOCAL (polska): coherent (everything as before) unless the switch is on
+            // and the bytes lie in a range registered as needing no read-back.
+            tier: AtomicU8::new(if buffer_tiers_on() { classify_non_uma_range(start, len) } else { BufferTier::Tier3Coherent } as u8),
             place: None,
+            wc: false,
         }
+    }
+
+    /// LOCAL (polska): this copy's [`BufferTier`].
+    pub(crate) fn tier(&self) -> BufferTier {
+        match self.tier.load(Ordering::Relaxed) {
+            1 => BufferTier::Tier1GpuPrivate,
+            2 => BufferTier::Tier2Upload,
+            _ => BufferTier::Tier3Coherent,
+        }
+    }
+
+    /// LOCAL (polska): this copy is known to be of `tier` (its maker says so: the
+    /// arenas of `crate::memory`). Nothing changes without `VICTORY_BUFFER_TIERS=1`.
+    pub(crate) fn set_tier(&self, tier: BufferTier) {
+        if buffer_tiers_on() {
+            self.tier.store(tier as u8, Ordering::Relaxed);
+        }
+    }
+
+    /// LOCAL (polska, `VICTORY_BUFFER_TIERS=1`): nothing the card writes here is
+    /// wanted back, as positively known ([`BufferTier`]): `Host::card_before` makes
+    /// no hashes of it, compares and fetches none of its declared ranges. False for
+    /// every copy not known so, and for every copy without the switch.
+    pub(crate) fn skips_readback(&self) -> bool {
+        buffer_tiers_on() && matches!(self.tier(), BufferTier::Tier1GpuPrivate | BufferTier::Tier2Upload)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -3013,6 +3227,14 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
+        // LOCAL (wc-vram): in card memory (`crate::wc_vram`) no snapshot and nothing to copy back
+        // either, but the range is declared for the flights' written set, so that what reads it
+        // on the CPU (fills, textures, copies, value waits, pulls) goes behind the writer.
+        if self.wc {
+            self.written.store(true, Ordering::Relaxed);
+            list.defer_wc_write(self, address as usize, len.min(self.left(address)) as usize);
+            return;
+        }
         if self.place.is_some() {
             return;
         }
@@ -3673,6 +3895,18 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        // LOCAL (gpu-first): by class (`VICTORY_CLASS_STATS`; off: no clock read).
+        let timed = crate::memclass::timer();
+        let copied = self.update_inner(address, len);
+        if timed.is_some() {
+            crate::memclass::add_since(crate::memclass::M::RefreshNs, address, timed);
+            crate::memclass::add(crate::memclass::M::Refreshed, address, copied as u64);
+        }
+        copied
+    }
+
+    /// [`Shadow::update`].
+    fn update_inner(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -3750,6 +3984,8 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // LOCAL (gpu-first): by class (`VICTORY_CLASS_STATS`).
+        crate::memclass::add_span(crate::memclass::M::Checked, from, to - from);
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -3889,7 +4125,11 @@ impl Shadow {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
-        let bytes = self.take_all(runs);
+        // LOCAL (journal): of the pages taken before and written since, the parts
+        // DirectStorage wrote after they were taken (`VICTORY_STREAM_JOURNAL`; empty
+        // when off): copied without being compared (`Shadow::take_fresh`).
+        let fresh = crate::stream_journal::fresh_parts(&again_at);
+        let bytes = self.take_all(runs, fresh);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -3904,16 +4144,19 @@ impl Shadow {
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
-    fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
+    /// LOCAL (journal): `fresh`, [`crate::stream_journal::fresh_parts`] of
+    /// the pages taken before (empty without the journal).
+    fn take_all(&self, runs: Vec<(usize, usize, bool)>, fresh: Vec<(usize, u16)>) -> usize {
         const LONG: usize = 1 << 20;
         const PART: usize = 256 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {
-                self.take(from, to, known);
+                self.take_fresh(from, to, known, &fresh);
             }
             return bytes;
         }
+        let fresh = Arc::new(fresh);
         let mut parts = Vec::with_capacity(bytes / PART + runs.len());
         for (from, to, known) in runs {
             let mut at = from;
@@ -3930,7 +4173,7 @@ impl Shadow {
             // the borrow of `self` ends. The parts lie apart.
             let this = unsafe { &*(this as *const Shadow) };
             let (from, to, known) = parts[i];
-            this.take(from, to, known);
+            this.take_fresh(from, to, known, &fresh);
         });
         bytes
     }
@@ -3954,7 +4197,15 @@ impl Shadow {
     /// is written since: where it may be only the landing that wrote it, the
     /// 4 KiB that title memory and the CPU's side have alike are left as they
     /// are, and nothing of them is sent ([`land_echo`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn take_landed(&self, from: usize, to: usize) -> usize {
+        self.take_landed_fresh(from, to, &[])
+    }
+
+    /// [`Shadow::take_landed`]; LOCAL (journal): the 4 KiB parts `fresh` names
+    /// ([`crate::stream_journal::fresh_parts`]) were written by DirectStorage
+    /// after the copy took them, and are copied without the compare.
+    fn take_landed_fresh(&self, from: usize, to: usize, fresh: &[(usize, u16)]) -> usize {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -3997,7 +4248,20 @@ impl Shadow {
                     // nothing else reads or writes there: no shader's range
                     // holds it, and the parts of a refresh lie apart.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
-                    if title == held {
+                    // LOCAL (journal): new bytes, not an echo of a landing. Off on
+                    // landing-noted pages (review): "fresh" over-reports under ask-once,
+                    // and a page both streamed and landed in that window would push CPU
+                    // bytes over an undeclared GPU write. The echo check below stays.
+                    let streamed = false
+                        && !fresh.is_empty()
+                        && next - at == KERNEL_PAGE
+                        && crate::stream_journal::parts_of(fresh, at / PAGE) >> (at % PAGE / KERNEL_PAGE) & 1 != 0;
+                    if streamed {
+                        crate::stream_journal::count(crate::stream_journal::C::CompareSkipped, (next - at) as u64);
+                        held.copy_from_slice(title);
+                        self.changed(at - start, next - start);
+                        self.card_changed(at - start, next - start);
+                    } else if title == held {
                         ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
                     } else {
                         ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
@@ -4014,14 +4278,23 @@ impl Shadow {
 
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
+    #[allow(dead_code)] // LOCAL (journal): the callers take `take_fresh`.
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        self.take_fresh(from, to, known, &[])
+    }
+
+    /// [`Shadow::take`]; LOCAL (journal): the 4 KiB parts `fresh` names
+    /// ([`crate::stream_journal::fresh_parts`]: DirectStorage wrote them after
+    /// the copy took them) go in whole, without the compare. Bytes that are
+    /// equal go in as well: no change, and they go up once more.
+    fn take_fresh(&self, from: usize, to: usize, known: bool, fresh: &[(usize, u16)]) -> usize {
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
-                return self.take_landed(from, to);
+                return self.take_landed_fresh(from, to, fresh);
             }
             return self.copy(from, to);
         };
@@ -4041,7 +4314,14 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = if whole {
+                    vec![(0, n)]
+                } else if known && !fresh.is_empty() {
+                    // LOCAL (journal)
+                    runs_with_fresh(at, held, title, crate::stream_journal::parts_of(fresh, at / PAGE))
+                } else {
+                    dword_runs(at, held, title, 0)
+                };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
@@ -4853,8 +5133,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        // LOCAL: windows over views may be longer than a cell
+        // (`crate::inplace::longest`; 0 unless `VICTORY_INPLACE_VIEWS`).
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .range((at.saturating_sub(WINDOW.max(crate::inplace::longest())), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
@@ -4871,6 +5153,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     for shadow in gone {
+        // LOCAL: heap slots made on a window over a view are made anew.
+        if shadow.place.as_ref().is_some_and(|place| place.2) {
+            crate::inplace::let_go_view(&shadow.buffer);
+        }
         crate::host::retire(shadow);
     }
     n
@@ -4969,6 +5255,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
+        // LOCAL (wc-vram): in a block in card memory (`VICTORY_WC_VRAM`), the buffer is that
+        // memory itself, whatever its size: no copy, no card copy.
+        if let Some(placed) = crate::wc_vram::place(key.0, len) {
+            entry.shadow = Some(Arc::new(Shadow::wc_placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
@@ -5274,6 +5566,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    // LOCAL (wc-vram): in a block in card memory (`VICTORY_WC_VRAM`), the window is that
+    // memory itself.
+    if let Some(placed) = crate::wc_vram::place(start, len) {
+        let shadow = Arc::new(Shadow::wc_placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
@@ -5585,4 +5885,130 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// LOCAL: windows over views in place (`crate::inplace::views_on`) and the
+/// runtime's changes of mapping.
+#[cfg(test)]
+mod in_place_view_tests {
+    use super::{LOOSE, Shadow};
+    use std::sync::Arc;
+
+    const K64: usize = 64 << 10;
+
+    /// A window over a run of a committed section is let go when the view
+    /// it lies in is unmapped, and not when another address of one of its
+    /// pages is: that address showing something else changes nothing the
+    /// window reads. The heap slots made on it are told to be made anew.
+    #[test]
+    fn warp_a_window_over_a_view_is_let_go_when_its_own_view_changes() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let _on = crate::inplace::tests::views_on_here();
+        let (section, a, b) = crate::inplace::tests::committed_section(4);
+        let (start, len) = ((a + K64) as u64, 2 * K64 as u64);
+        let placed = crate::inplace::place_view_counted(&device, start, len).expect("placed");
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        assert!(shadow.in_place());
+        LOOSE.write().unwrap().insert((start, len), shadow.clone());
+        crate::inplace::slot_shows(0x3000, 11, &shadow.buffer);
+        // The alias of page 2 is unmapped (as `xmem` tells it first).
+        crate::title_memory_unmapping(b, K64);
+        assert!(LOOSE.read().unwrap().contains_key(&(start, len)), "an alias changing lets nothing go");
+        assert!(crate::inplace::slots_stale(0x3000).is_empty());
+        // Page 3 of the view, past the window: nothing either.
+        crate::title_memory_unmapping(a + 3 * K64, K64);
+        assert!(LOOSE.read().unwrap().contains_key(&(start, len)), "a page past it lets nothing go");
+        // Page 2, which the window holds (the alias's page, at its own
+        // address), is.
+        crate::title_memory_unmapping(a + 2 * K64, K64);
+        assert!(!LOOSE.read().unwrap().contains_key(&(start, len)), "the window over the view is let go");
+        assert_eq!(crate::inplace::slots_stale(0x3000), vec![11]);
+        // The next ask is turned down until the runtime tells of a view there.
+        assert!(crate::inplace::place_view(&device, start, len).is_err());
+        drop(shadow);
+        crate::inplace::tests::committed_section_gone(section, a, b, 4);
+    }
+
+    /// The let go finds a window over a view that begins more than a cell
+    /// (`WINDOW`) below the memory that changes.
+    #[test]
+    fn warp_a_long_window_over_a_view_is_let_go_from_its_far_end() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let _on = crate::inplace::tests::views_on_here();
+        // SAFETY: a section and a view of the test's own.
+        let (section, at) = unsafe {
+            use windows_sys::Win32::System::Memory as mem;
+            let size = 128 * K64; // 8 MiB: two cells
+            let section = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_COMMIT,
+                0,
+                size as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let at = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, size).Value as usize;
+            assert_ne!(at, 0);
+            crate::inplace::title_memory_section(section as usize, size as u64, true);
+            crate::inplace::title_memory_view(at, size, section as usize, 0);
+            (section, at)
+        };
+        let len = (128 * K64) as u64;
+        let placed = crate::inplace::place_view_counted(&device, at as u64, len).expect("placed");
+        let shadow = Arc::new(Shadow::placed(placed, at as u64, len, true));
+        LOOSE.write().unwrap().insert((at as u64, len), shadow.clone());
+        crate::title_memory_unmapping(at + 127 * K64, K64);
+        assert!(!LOOSE.read().unwrap().contains_key(&(at as u64, len)), "found from 8 MiB above its start");
+        drop(shadow);
+        crate::inplace::views_gone(at, 128 * K64);
+        crate::inplace::title_memory_section_gone(section as usize);
+        // SAFETY: the test's own view and section.
+        unsafe {
+            use windows_sys::Win32::System::Memory as mem;
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut std::ffi::c_void });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+}
+
+/// LOCAL (polska): the tiers ported from POLSKAGUROM 93f36ba (`VICTORY_BUFFER_TIERS`):
+/// only what lies wholly in a registered range skips; anything else, the default.
+#[cfg(test)]
+mod tier_tests {
+    use super::{BufferTier, RangeTag, classify_non_uma_range, register_non_uma_range, unregister_non_uma_range};
+
+    #[test]
+    fn only_copies_wholly_in_a_registered_range_skip() {
+        // (Addresses of their own: the ranges are shared by the tests of this binary.)
+        const A: u64 = 0x7A00_0000_0000;
+        // Nothing registered: coherent, whatever the copy.
+        assert_eq!(classify_non_uma_range(A, 0x1000), BufferTier::Tier3Coherent);
+        assert_eq!(classify_non_uma_range(A, 0), BufferTier::Tier3Coherent);
+        register_non_uma_range(A, 0x10_0000, BufferTier::Tier1GpuPrivate, RangeTag::BvhArena);
+        // Inside, to either end: GPU-private.
+        assert_eq!(classify_non_uma_range(A, 0x10_0000), BufferTier::Tier1GpuPrivate);
+        assert_eq!(classify_non_uma_range(A + 0x1000, 0x1000), BufferTier::Tier1GpuPrivate);
+        assert_eq!(classify_non_uma_range(A + 0xF_F000, 0x1000), BufferTier::Tier1GpuPrivate);
+        // Partly outside (93f36ba: GPU-private): the rest is not known, coherent.
+        assert_eq!(classify_non_uma_range(A + 0xF_F000, 0x2000), BufferTier::Tier3Coherent);
+        assert_eq!(classify_non_uma_range(A - 0x1000, 0x2000), BufferTier::Tier3Coherent);
+        // Beside it: coherent.
+        assert_eq!(classify_non_uma_range(A + 0x10_0000, 0x1000), BufferTier::Tier3Coherent);
+        // A range that must come back, over part of it: coherent there, whatever else.
+        register_non_uma_range(A + 0x8_0000, 0x1000, BufferTier::Tier3Coherent, RangeTag::ReadbackRequired);
+        assert_eq!(classify_non_uma_range(A + 0x7_F000, 0x2000), BufferTier::Tier3Coherent);
+        assert_eq!(classify_non_uma_range(A, 0x1000), BufferTier::Tier1GpuPrivate);
+        // A CPU-only range inside the GPU-private one: GPU-private first.
+        register_non_uma_range(A + 0x2_0000, 0x1000, BufferTier::Tier2Upload, RangeTag::Generic);
+        assert_eq!(classify_non_uma_range(A + 0x2_0000, 0x1000), BufferTier::Tier1GpuPrivate);
+        unregister_non_uma_range(A);
+        assert_eq!(classify_non_uma_range(A + 0x2_0000, 0x1000), BufferTier::Tier2Upload);
+        assert_eq!(classify_non_uma_range(A, 0x1000), BufferTier::Tier3Coherent);
+        unregister_non_uma_range(A + 0x2_0000);
+        unregister_non_uma_range(A + 0x8_0000);
+        assert_eq!(classify_non_uma_range(A + 0x2_0000, 0x1000), BufferTier::Tier3Coherent);
+    }
 }

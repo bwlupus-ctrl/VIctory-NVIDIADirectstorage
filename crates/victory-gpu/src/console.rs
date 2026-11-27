@@ -1,8 +1,6 @@
 //! Which console the title runs on. Titles pick settings (resolution,
 //! memory budgets) by it, so the user chooses; Series X unless told.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 const GIB: usize = 1 << 30;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,15 +32,25 @@ impl Console {
     }
 }
 
-static SERIES_S: AtomicBool = AtomicBool::new(false);
-
-/// Set before the title starts.
+/// Set before the title starts (before it makes any resource: render-XOR
+/// layouts take their addresses from the model, DexNom-VIctory 570a941).
+/// The model is kept in one place, `victory_formats::texture`, which the
+/// layouts read.
 pub fn set(console: Console) {
-    SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
+    if !victory_formats::texture::set_series_s_tiling(console == Console::SeriesS) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::error!(
+                console = console.name(),
+                "the console model changed after render-XOR textures were laid out for the other: \
+                 those keep the other's addresses (set the console before the title starts)"
+            );
+        });
+    }
 }
 
 pub fn current() -> Console {
-    if SERIES_S.load(Ordering::Relaxed) {
+    if victory_formats::texture::series_s_tiling() {
         Console::SeriesS
     } else {
         Console::SeriesX

@@ -39,6 +39,8 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod heap_marks;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -61,6 +63,9 @@ pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
+// LOCAL (port of cool_fox): host-memory admission for texture uploads.
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -71,8 +76,21 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+// LOCAL (gpu-first): title memory by allocation class (`VICTORY_CLASS_STATS`, `VICTORY_HONOUR_WC`).
+#[cfg(windows)]
+pub mod memclass;
+// LOCAL (page-kinds): measurement-only page table snapshots and cross-tabs.
+#[cfg(windows)]
+pub mod pagekinds;
+// LOCAL (heap-probe): measurements of the title's hot 174 MB pool range (`VICTORY_HEAP_PROBE=1`;
+// off by default, then nothing is recorded and nothing changes).
+#[cfg(windows)]
+pub mod heapprobe;
 #[cfg(windows)]
 mod shadow;
+// LOCAL (journal): what DirectStorage wrote, for the GPU side (`VICTORY_STREAM_JOURNAL=1`).
+#[cfg(windows)]
+pub mod stream_journal;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
@@ -92,6 +110,10 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+// LOCAL (wc-vram): the title's write-combined GPU blocks in card memory through the BAR
+// (`VICTORY_WC_VRAM=1`; off by default).
+#[cfg(windows)]
+pub mod wc_vram;
 
 #[cfg(windows)]
 pub use host::on_failure;
