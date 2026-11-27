@@ -1,3 +1,35 @@
+# VIctory-NVIDIA DirectStorage fork
+
+**This fork, branch `nvidia-vram-wip`:** VIctory-NVIDIA tuned for an RTX 5090,
+built on the rule that **graphics data lives on the GPU and the CPU never
+shuttles it**. The Xbox's memory is one fast pool shared by CPU and GPU, and the
+game streams the open world constantly. Everything below is behind a switch.
+
+- **Write-combined block in VRAM** (`VICTORY_WC_VRAM`): the title writes straight
+  to the card through resizable BAR. Average fps went from about 17.7 to about 23.
+- **Descriptor view-table leak fixed**: fps no longer decays over an hour of play
+  (it used to fall from 24.5 to 11.6).
+- **The title's own page-kind table** (`VICTORY_PAGE_KINDS`): finds which memory
+  only the GPU uses, as groundwork for moving it to the card entirely.
+- **X3D V-Cache pinning** (`VICTORY_VCACHE_CORES`).
+- **Water dark blocks fixed, early depth and submit-thread cuts**, ported from
+  trustno1-coder's later `main` and reviewed.
+- **A verified DLSS file fetch**: `scripts/get-dlss.sh` checks the SHA-256 and
+  NVIDIA's signature on every DLL.
+
+The switches, recommended settings, results, known issues and roadmap are in
+**[docs/nvidia-directstorage-fork.md](docs/nvidia-directstorage-fork.md)**.
+
+Build it with:
+
+```bash
+cargo build --profile diag -p victory --features diagnostics
+```
+
+The upstream README follows.
+
+---
+
 # VIctory on NVIDIA
 
 ## Built from many projects
