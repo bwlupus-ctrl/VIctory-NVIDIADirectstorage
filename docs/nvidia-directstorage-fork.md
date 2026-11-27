@@ -77,6 +77,17 @@ Everything is behind a switch and **off unless noted**.
 | `VICTORY_HEAP_SYNC_FIRST=1`, `VICTORY_SPANS_QUICK=1`, `VICTORY_SYNC_FINE=1` | Heap-record sync speed-ups. |
 | `VICTORY_HEAP_SYNC_AT_SUBMIT`, `VICTORY_SYNC_IN_PLACE` | **Keep these off.** Reviews found ordering bugs that can give stale descriptors. `SYNC_IN_PLACE` also bypasses the `WC_VRAM` writer fence. |
 
+### From ScarlettPort, Vice-Tay and the megafork (ported 2026-11-27, reviewed)
+
+| Switch | What it does |
+|---|---|
+| Write-watch lookups (default on) | Ranges already asked for are found by binary search, not a scan. The answers are identical; Codex checked 279,616 cases. |
+| `VICTORY_SAME_HOST_HEAPS` (default on, `=0` off) | Skips redundant `SetDescriptorHeaps` calls and root-signature resets when the title switches to heaps that are the same on the host. |
+| Fewer allocations and lock waits (default on) | In the write watch, shadow copies, snapshot pool and texture read-backs (Vice-Tay). |
+| `VICTORY_READBACK_POOL=1` | Reuses texture read-back buffers. |
+| `--features mimalloc` | Builds with Microsoft's mimalloc allocator in place of the Windows heap. It cuts lock waits between threads that allocate at the same time. Off by default. |
+| Pipeline crash guard (default on) | A pipeline build that panics is refused, not left unmade, so nothing waits on it forever (megafork). |
+
 ### Resolution
 
 | Switch | What it does |
